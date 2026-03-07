@@ -102,9 +102,41 @@ jobs:
           key: clamav-install-x64-${{ hashFiles('CMakeLists.txt', 'CMakeOptions.cmake', 'vcpkg.json', 'cmake/**', 'clamd/**', 'clamscan/**', 'freshclam/**', 'libclamav/**', 'libfreshclam/**') }}
           restore-keys: clamav-install-x64-
 
-      - name: Install vcpkg dependencies
+      - name: Install vcpkg dependencies (retry)
         run: |
-          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows
+          $ErrorActionPreference = "Stop"
+          $vcpkgExe = "$env:VCPKG_ROOT\vcpkg.exe"
+          $maxAttempts = 5
+
+          # These settings are harmless for normal cases and can improve stability
+          # on flaky CI networks/proxies.
+          git config --global http.version HTTP/1.1
+          git config --global http.lowSpeedLimit 1000
+          git config --global http.lowSpeedTime 60
+
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            Write-Host "vcpkg install attempt $attempt/$maxAttempts"
+
+            & $vcpkgExe install --triplet x64-windows
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "vcpkg install succeeded"
+              break
+            }
+
+            if ($attempt -eq $maxAttempts) {
+              throw "vcpkg install failed after $maxAttempts attempts"
+            }
+
+            Write-Host "::warning::vcpkg install failed. Cleaning registry cache and retrying..."
+            $registryGitCache = Join-Path $env:LOCALAPPDATA "vcpkg\registries\git"
+            if (Test-Path $registryGitCache) {
+              Remove-Item $registryGitCache -Recurse -Force -ErrorAction SilentlyContinue
+            }
+
+            $sleepSeconds = [Math]::Min(60, [int]([Math]::Pow(2, $attempt) * 5))
+            Write-Host "Sleeping $sleepSeconds seconds before retry"
+            Start-Sleep -Seconds $sleepSeconds
+          }
         shell: pwsh
 
       - name: Cache Rust build
