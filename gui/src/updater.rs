@@ -140,11 +140,22 @@ impl DatabaseUpdater {
 fn ensure_freshclam_conf(conf_path: &std::path::Path, db_dir: &std::path::Path) {
     if !conf_path.exists() {
         let content = format!(
-            "DatabaseMirror database.clamav.net\n\
+            "# China mirror sources for faster downloads in mainland China\n\
+             # Uncomment the mirror closest to you for best performance\n\
+             \n\
+             # Primary mirrors - try China sources first\n\
+             PrivateMirror mirrors.tuna.tsinghua.edu.cn\n\
+             PrivateMirror mirrors.ustc.edu.cn\n\
+             PrivateMirror mirrors.nju.edu.cn\n\
+             \n\
+             # Official mirror (fallback)\n\
+             DatabaseMirror database.clamav.net\n\
+             \n\
              DatabaseDirectory {}\n\
              Foreground yes\n\
-             MaxAttempts 3\n\
-             ConnectTimeout 30\n",
+             MaxAttempts 5\n\
+             ConnectTimeout 30\n\
+             ReceiveTimeout 60\n",
             db_dir.display()
         );
         let _ = std::fs::write(conf_path, content);

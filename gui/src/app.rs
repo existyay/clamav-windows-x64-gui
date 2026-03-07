@@ -436,7 +436,6 @@ impl ClamAvApp {
                         self.scan_engine.cancel_scan();
                     }
                 }
-                ScanState::Paused => {}
             }
         });
 
@@ -448,9 +447,10 @@ impl ClamAvApp {
         let scanned = self.scan_engine.stats.scanned_files.to_string();
         let infected = self.scan_engine.stats.infected_files.to_string();
         let infected_color = if self.scan_engine.stats.infected_files > 0 { theme::DANGER } else { theme::SUCCESS };
+        let scanned_data = format!("{:.1} MB", self.scan_engine.stats.scanned_data_mb);
         let elapsed = format!("{:.1}s", self.scan_engine.stats.elapsed_secs);
 
-        ui.columns(3, |cols| {
+        ui.columns(4, |cols| {
             cols[0].vertical_centered(|ui| {
                 egui::Frame::new()
                     .fill(theme::BG_CARD)
@@ -478,6 +478,19 @@ impl ClamAvApp {
                     });
             });
             cols[2].vertical_centered(|ui| {
+                egui::Frame::new()
+                    .fill(theme::BG_CARD)
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(egui::Margin::same(12))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(55, 55, 55)))
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(egui::RichText::new(&scanned_data).font(FontId::proportional(26.0)).color(theme::TEXT_PRIMARY));
+                            ui.label(egui::RichText::new("扫描数据").font(FontId::proportional(13.0)).color(theme::TEXT_SECONDARY));
+                        });
+                    });
+            });
+            cols[3].vertical_centered(|ui| {
                 egui::Frame::new()
                     .fill(theme::BG_CARD)
                     .corner_radius(CornerRadius::same(10))

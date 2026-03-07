@@ -32,7 +32,6 @@ pub struct ThreatInfo {
 pub enum ScanState {
     Idle,
     Scanning,
-    Paused,
     Finished,
 }
 
@@ -243,6 +242,7 @@ fn run_clamscan(
     let reader = BufReader::new(stdout);
     let mut scanned: u64 = 0;
     let mut infected: u64 = 0;
+    let mut scanned_data_mb: f64 = 0.0;
 
     for line in reader.lines() {
         if let Ok(cancelled) = cancel.lock() {
@@ -250,7 +250,7 @@ fn run_clamscan(
                 let _ = tx.send(ScanMessage::Finished(ScanStats {
                     scanned_files: scanned,
                     infected_files: infected,
-                    scanned_data_mb: 0.0,
+                    scanned_data_mb,
                     elapsed_secs: start.elapsed().as_secs_f64(),
                 }));
                 return;
@@ -286,12 +286,16 @@ fn run_clamscan(
             if let Some(n) = extract_number(&line) {
                 infected = n;
             }
+        } else if line.contains("Data scanned:") {
+            if let Some(mb) = extract_data_scanned_mb(&line) {
+                scanned_data_mb = mb;
+            }
         }
 
         let _ = tx.send(ScanMessage::Stats(ScanStats {
             scanned_files: scanned,
             infected_files: infected,
-            scanned_data_mb: 0.0,
+            scanned_data_mb,
             elapsed_secs: start.elapsed().as_secs_f64(),
         }));
     }
@@ -299,7 +303,7 @@ fn run_clamscan(
     let _ = tx.send(ScanMessage::Finished(ScanStats {
         scanned_files: scanned,
         infected_files: infected,
-        scanned_data_mb: 0.0,
+        scanned_data_mb,
         elapsed_secs: start.elapsed().as_secs_f64(),
     }));
 }
@@ -310,4 +314,20 @@ fn extract_number(line: &str) -> Option<u64> {
         .trim()
         .parse::<u64>()
         .ok()
+}
+
+fn extract_data_scanned_mb(line: &str) -> Option<f64> {
+    let rhs = line.split(':').nth(1)?.trim();
+    let mut parts = rhs.split_whitespace();
+    let value = parts.next()?.parse::<f64>().ok()?;
+    let unit = parts.next().unwrap_or("MB").to_ascii_uppercase();
+
+    match unit.as_str() {
+        "TB" => Some(value * 1024.0 * 1024.0),
+        "GB" => Some(value * 1024.0),
+        "MB" => Some(value),
+        "KB" => Some(value / 1024.0),
+        "B" => Some(value / (1024.0 * 1024.0)),
+        _ => Some(value),
+    }
 }

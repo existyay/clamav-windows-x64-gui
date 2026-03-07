@@ -192,14 +192,15 @@ fn realtime_watch_loop(
                     if path.is_file() {
                         if !known_files.contains(&path) {
                             // Check if modified recently (last 30s) or never seen
-                            let dominated = entry
+                            let is_recent = entry
                                 .metadata()
                                 .ok()
                                 .and_then(|m| m.modified().ok())
-                                .map(|t| t.elapsed().unwrap_or_default() < Duration::from_secs(30))
-                                .unwrap_or(false);
+                                .and_then(|t| t.elapsed().ok())
+                                .map(|elapsed| elapsed < Duration::from_secs(30))
+                                .unwrap_or(false); // If we can't get time, assume not recent
 
-                            if dominated || !known_files.contains(&path) {
+                            if is_recent || !known_files.contains(&path) {
                                 new_files.push(path.clone());
                             }
                             known_files.insert(path);

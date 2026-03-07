@@ -18,7 +18,6 @@ const BG_LIGHT: Color32 = Color32::from_rgb(250, 250, 250);
 const BG_PANEL_LIGHT: Color32 = Color32::from_rgb(245, 245, 245);
 const BG_CARD_LIGHT: Color32 = Color32::from_rgb(255, 255, 255);
 const TEXT_PRIMARY_LIGHT: Color32 = Color32::from_rgb(33, 33, 33);
-const TEXT_SECONDARY_LIGHT: Color32 = Color32::from_rgb(117, 117, 117);
 const HOVERED_LIGHT: Color32 = Color32::from_rgb(240, 240, 240);
 
 pub const SIDEBAR_WIDTH: f32 = 200.0;
