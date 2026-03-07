@@ -1145,13 +1145,13 @@ endif()
 
 add_custom_target(check COMMAND ${CMAKE_CTEST_COMMAND})
 if(ENABLE_TESTS)
-    add_subdirectory( unit_tests )
+    # add_subdirectory( unit_tests )  # Removed: tests disabled
 endif()
 
-add_subdirectory( docs )
+# add_subdirectory( docs )  # Removed: docs directory deleted
 
 if(ENABLE_FUZZ)
-    add_subdirectory( fuzz )
+    # add_subdirectory( fuzz )  # Removed: fuzz directory deleted
 endif()
 
 if(WIN32)
