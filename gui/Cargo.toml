@@ -1,6 +1,6 @@
 [package]
 name = "clamav-gui"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 description = "Modern GUI for ClamAV antivirus scanner"
 
@@ -29,6 +29,7 @@ panic = "abort"
 [[bin]]
 name = "clamav-gui"
 path = "src/main.rs"
+
 
 
 
