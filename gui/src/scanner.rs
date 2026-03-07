@@ -61,6 +61,16 @@ impl Default for ScanEngine {
 
 impl ScanEngine {
     pub fn start_scan(&mut self, target: PathBuf, config: &AppConfig) {
+        self.start_scan_targets(vec![target], config);
+    }
+
+    pub fn start_scan_targets(&mut self, targets: Vec<PathBuf>, config: &AppConfig) {
+        if targets.is_empty() {
+            self.state = ScanState::Finished;
+            self.log_lines.push("ERROR: No valid scan targets found".to_string());
+            return;
+        }
+
         self.state = ScanState::Scanning;
         self.threats.clear();
         self.stats = ScanStats::default();
@@ -77,16 +87,18 @@ impl ScanEngine {
         let db_dir = config.database_dir.clone();
         let recursive = config.recursive_scan;
         let max_size = config.max_file_size_mb;
+        let max_threads = config.max_scan_threads;
         let scan_archives = config.scan_archives;
         let excludes = config.exclude_patterns.clone();
 
         std::thread::spawn(move || {
             run_clamscan(
                 clamscan,
-                target,
+                targets,
                 db_dir,
                 recursive,
                 max_size,
+                max_threads,
                 scan_archives,
                 excludes,
                 cancel,
@@ -159,10 +171,11 @@ impl ScanEngine {
 
 fn run_clamscan(
     clamscan_path: PathBuf,
-    target: PathBuf,
+    targets: Vec<PathBuf>,
     db_dir: PathBuf,
     recursive: bool,
     max_size_mb: u64,
+    max_threads: u32,
     scan_archives: bool,
     excludes: Vec<String>,
     cancel: Arc<Mutex<bool>>,
@@ -189,13 +202,12 @@ fn run_clamscan(
 
     cmd.arg(format!("--max-filesize={}M", max_size_mb));
     cmd.arg(format!("--max-scansize={}M", max_size_mb * 4));
-    
-    // Performance optimization: use multiple threads
-    cmd.arg("--max-threads=4");
-    
-    // Speed up scanning
-    cmd.arg("--max-rechwait=10");
-    cmd.arg("--max-files=10000");
+
+    // Use user-configured scan thread count when possible.
+    // Keep arguments conservative for compatibility across ClamAV versions.
+    if max_threads > 1 {
+        cmd.arg(format!("--max-threads={}", max_threads));
+    }
 
     if !scan_archives {
         cmd.arg("--no-archive");
@@ -207,7 +219,9 @@ fn run_clamscan(
         }
     }
 
-    cmd.arg(target.to_string_lossy().as_ref());
+    for target in &targets {
+        cmd.arg(target.to_string_lossy().as_ref());
+    }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -220,7 +234,7 @@ fn run_clamscan(
 
     let start = std::time::Instant::now();
 
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             let _ = tx.send(ScanMessage::Error(format!(
@@ -231,13 +245,29 @@ fn run_clamscan(
         }
     };
 
-    let stdout = match child.stdout {
+    let stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
             let _ = tx.send(ScanMessage::Error("No stdout from clamscan".into()));
             return;
         }
     };
+
+    let stderr = child.stderr.take();
+    let stderr_handle = std::thread::spawn(move || {
+        if let Some(stderr) = stderr {
+            let reader = BufReader::new(stderr);
+            let mut lines = Vec::new();
+            for line in reader.lines().map_while(Result::ok) {
+                if !line.trim().is_empty() {
+                    lines.push(line);
+                }
+            }
+            lines.join("\n")
+        } else {
+            String::new()
+        }
+    });
 
     let reader = BufReader::new(stdout);
     let mut scanned: u64 = 0;
@@ -298,6 +328,29 @@ fn run_clamscan(
             scanned_data_mb,
             elapsed_secs: start.elapsed().as_secs_f64(),
         }));
+    }
+
+    let status = child.wait();
+    let stderr_text = stderr_handle.join().unwrap_or_default();
+
+    if let Ok(exit_status) = status {
+        if !exit_status.success() {
+            let code = exit_status.code().map_or("unknown".to_string(), |c| c.to_string());
+            let details = if stderr_text.is_empty() {
+                "clamscan exited with non-zero status and no stderr output".to_string()
+            } else {
+                stderr_text
+            };
+
+            let _ = tx.send(ScanMessage::Error(format!(
+                "clamscan failed (exit code {}): {}",
+                code, details
+            )));
+            return;
+        }
+    } else if let Err(e) = status {
+        let _ = tx.send(ScanMessage::Error(format!("Failed waiting for clamscan: {}", e)));
+        return;
     }
 
     let _ = tx.send(ScanMessage::Finished(ScanStats {

@@ -120,7 +120,7 @@ impl ClamAvApp {
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                 ui.add_space(12.0);
                 ui.label(
-                    egui::RichText::new("v1.0.0")
+                    egui::RichText::new("v1.0.5")
                         .font(FontId::proportional(11.0))
                         .color(theme::text_secondary(dark_mode)),
                 );
@@ -335,37 +335,77 @@ impl ClamAvApp {
     }
 
     fn start_quick_scan(&mut self) {
-        // Scan critical system locations
-        let mut paths = Vec::new();
-        
+        // Quick scan should cover multiple critical locations.
+        let mut candidates = Vec::new();
+
         if let Some(home) = dirs::home_dir() {
-            paths.push(home.join("Downloads"));
-            paths.push(home.join("Desktop"));
-            paths.push(home.join("Documents"));
+            candidates.push(home.join("Downloads"));
+            candidates.push(home.join("Desktop"));
+            candidates.push(home.join("Documents"));
+            candidates.push(home.join("AppData").join("Local").join("Temp"));
         }
-        
-        // Temp directories
+
         if let Ok(temp) = std::env::var("TEMP") {
-            paths.push(std::path::PathBuf::from(temp));
+            candidates.push(std::path::PathBuf::from(temp));
         }
-        
-        // Use first valid path
-        for path in paths {
-            if path.exists() {
-                self.scan_target = path.to_string_lossy().to_string();
-                self.scan_engine.start_scan(path, &self.config);
-                break;
+
+        if let Ok(windir) = std::env::var("WINDIR") {
+            candidates.push(std::path::PathBuf::from(windir).join("Temp"));
+        }
+
+        let mut targets = Vec::new();
+        for path in candidates {
+            if path.exists() && !targets.iter().any(|p| p == &path) {
+                targets.push(path);
             }
         }
+
+        if targets.is_empty() {
+            self.scan_engine.log_lines.push("ERROR: 快速扫描未找到可用目录".to_string());
+            return;
+        }
+
+        let preview = targets
+            .iter()
+            .take(3)
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        self.scan_target = if targets.len() > 3 {
+            format!("快速扫描: {} ... (共 {} 个路径)", preview, targets.len())
+        } else {
+            format!("快速扫描: {}", preview)
+        };
+
+        self.scan_engine.start_scan_targets(targets, &self.config);
     }
 
     fn start_full_scan(&mut self) {
-        // Scan C: drive
-        let c_drive = std::path::PathBuf::from("C:\\");
-        if c_drive.exists() {
-            self.scan_target = "C:\\ (完整扫描)".to_string();
-            self.scan_engine.start_scan(c_drive, &self.config);
+        // Scan all available local drives (C:..Z:).
+        let mut drives = Vec::new();
+        for letter in b'C'..=b'Z' {
+            let root = format!("{}:\\", letter as char);
+            let path = std::path::PathBuf::from(&root);
+            if path.exists() {
+                drives.push(path);
+            }
         }
+
+        if drives.is_empty() {
+            self.scan_engine.log_lines.push("ERROR: 未找到可扫描磁盘".to_string());
+            return;
+        }
+
+        self.scan_target = format!(
+            "全盘扫描: {}",
+            drives
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+
+        self.scan_engine.start_scan_targets(drives, &self.config);
     }
 
     fn scan_panel(&mut self, ui: &mut egui::Ui) {
