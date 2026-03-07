@@ -337,6 +337,7 @@ fn run_scanner(
         // clamdscan 不需要指定数据库路径，由 clamd 管理
     } else {
         // clamscan 参数（独立扫描）
+        cmd.arg("--verbose");  // 启用详细输出以获取完整统计信息
         cmd.arg("--stdout");
 
         if db_dir.exists() {
@@ -424,6 +425,7 @@ fn run_scanner(
     let mut scanned: u64 = 0;
     let mut infected: u64 = 0;
     let mut scanned_data_mb: f64 = 0.0;
+    let mut last_stats_update = std::time::Instant::now();
 
     for line in reader.lines() {
         if let Ok(cancelled) = cancel.lock() {
@@ -454,11 +456,28 @@ fn run_scanner(
                     threat_name,
                 }));
             }
-        } else if line.contains(": OK") || line.contains("Scanning") {
+        } else if line.contains(": OK") {
+            // 仅在 verbose 模式下更新扫描文件统计（减少消息频率）
             scanned += 1;
-            let _ = tx.send(ScanMessage::Progress(line.clone()));
+            
+            // 定期发送进度更新（每秒一次）
+            if last_stats_update.elapsed().as_secs_f64() > 1.0 {
+                let _ = tx.send(ScanMessage::Stats(ScanStats {
+                    scanned_files: scanned,
+                    infected_files: infected,
+                    scanned_data_mb,
+                    elapsed_secs: start.elapsed().as_secs_f64(),
+                }));
+                last_stats_update = std::time::Instant::now();
+            }
+        } else if line.starts_with("Scanning") {
+            // 更新当前正在扫描的文件
+            let file = line.replace("Scanning", "").trim().to_string();
+            if !file.is_empty() {
+                let _ = tx.send(ScanMessage::Progress(file));
+            }
         } else if line.starts_with("-------") {
-            // Summary section begins
+            // Summary section begins，准备等待统计行
         } else if line.contains("Scanned files:") {
             if let Some(n) = extract_number(&line) {
                 scanned = n;
@@ -472,35 +491,36 @@ fn run_scanner(
                 scanned_data_mb = mb;
             }
         }
-
-        let _ = tx.send(ScanMessage::Stats(ScanStats {
-            scanned_files: scanned,
-            infected_files: infected,
-            scanned_data_mb,
-            elapsed_secs: start.elapsed().as_secs_f64(),
-        }));
     }
 
     let status = child.wait();
     let stderr_text = stderr_handle.join().unwrap_or_default();
 
+    // 发送最终统计信息
+    let _ = tx.send(ScanMessage::Stats(ScanStats {
+        scanned_files: scanned,
+        infected_files: infected,
+        scanned_data_mb,
+        elapsed_secs: start.elapsed().as_secs_f64(),
+    }));
+
     if let Ok(exit_status) = status {
         if !exit_status.success() {
             let code = exit_status.code().map_or("unknown".to_string(), |c| c.to_string());
             let details = if stderr_text.is_empty() {
-                "clamscan exited with non-zero status and no stderr output".to_string()
+                "扫描器退出时返回非零状态".to_string()
             } else {
                 stderr_text
             };
 
             let _ = tx.send(ScanMessage::Error(format!(
-                "clamscan failed (exit code {}): {}",
+                "扫描失败 (exit code {}): {}",
                 code, details
             )));
             return;
         }
     } else if let Err(e) = status {
-        let _ = tx.send(ScanMessage::Error(format!("Failed waiting for clamscan: {}", e)));
+        let _ = tx.send(ScanMessage::Error(format!("等待扫描器失败: {}", e)));
         return;
     }
 
