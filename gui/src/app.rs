@@ -44,11 +44,7 @@ impl ClamAvApp {
         let mut updater = DatabaseUpdater::default();
         updater.check_database_status(&config);
 
-        // 自动启动 clamd 守护进程（提升性能）
-        let mut scan_engine = ScanEngine::default();
-        if config.clamd_path().exists() {
-            let _ = scan_engine.clamd_daemon.start(&config);
-        }
+        let scan_engine = ScanEngine::default();
 
         Self {
             config,
@@ -142,25 +138,23 @@ impl ClamAvApp {
 
         // Status cards row - enhanced with icons and better styling
         ui.columns(4, |cols| {
-            // ClamAV 引擎状态 - 显示是否使用守护进程高性能模式
+            // ClamAV 引擎状态
             cols[0].vertical_centered(|ui| {
-                let daemon_running = self.scan_engine.clamd_daemon.is_running;
                 let clamscan_exists = self.config.clamscan_path().exists();
-                let status_ok = daemon_running || clamscan_exists;
                 
                 enhanced_card(ui, |ui| {
-                    status_icon(ui, if daemon_running { "⚡" } else if clamscan_exists { "⚙" } else { "✖" });
+                    status_icon(ui, if clamscan_exists { "⚙" } else { "✖" });
                     ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new(if daemon_running { "高性能" } else if clamscan_exists { "标准" } else { "未找到" })
+                        egui::RichText::new(if clamscan_exists { "就绪" } else { "未找到" })
                             .font(FontId::proportional(16.0))
                             .strong(),
                     );
                     ui.label(
-                        egui::RichText::new(if daemon_running { "守护进程模式" } else { "引擎状态" })
+                        egui::RichText::new("引擎状态")
                             .font(FontId::proportional(11.0)),
                     );
-                }, if daemon_running { theme::SUCCESS } else if status_ok { theme::WARNING } else { theme::DANGER });
+                }, if clamscan_exists { theme::SUCCESS } else { theme::DANGER });
             });
 
             // Realtime status
@@ -1058,54 +1052,6 @@ impl ClamAvApp {
             }
             ui.add_space(12.0);
 
-            // 性能设置
-            ui.label(theme::subheading("性能设置"));
-            ui.add_space(4.0);
-            
-            let daemon_running = self.scan_engine.clamd_daemon.is_running;
-            let daemon_available = self.config.clamd_path().exists();
-            
-            if daemon_available {
-                ui.horizontal(|ui| {
-                    ui.label(if daemon_running { "⚡" } else { "⚙" });
-                    ui.label(
-                        egui::RichText::new(if daemon_running {
-                            "ClamAV 守护进程已启动（高性能模式）"
-                        } else {
-                            "ClamAV 守护进程未启动（标准模式）"
-                        })
-                        .color(if daemon_running { theme::SUCCESS } else { theme::text_secondary(ui.visuals().dark_mode) }),
-                    );
-                });
-                
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if daemon_running {
-                        if ui.add(theme::danger_button("⏹ 停止守护进程")).clicked() {
-                            self.scan_engine.clamd_daemon.stop();
-                        }
-                    } else {
-                        if ui.add(theme::accent_button("▶ 启动守护进程")).clicked() {
-                            let _ = self.scan_engine.clamd_daemon.start(&self.config);
-                        }
-                    }
-                });
-                
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("💡 守护进程模式：病毒库常驻内存，扫描速度提升 10-50 倍")
-                        .font(FontId::proportional(11.0))
-                        .color(theme::text_secondary(ui.visuals().dark_mode)),
-                );
-            } else {
-                ui.label(
-                    egui::RichText::new("⚠ clamd.exe 未找到，无法使用高性能模式")
-                        .color(theme::WARNING),
-                );
-            }
-            
-            ui.add_space(12.0);
-
             // Scan options
             ui.label(theme::subheading("扫描选项"));
             ui.add_space(4.0);
@@ -1246,7 +1192,7 @@ impl Drop for ClamAvApp {
         {
             self.realtime.stop();
         }
-        // ScanEngine::Drop will handle killing scan child + clamd daemon
+        // ScanEngine::Drop will handle killing scan child process
     }
 }
 
@@ -1261,9 +1207,6 @@ impl eframe::App for ClamAvApp {
         self.scan_engine.poll_messages();
         self.updater.poll_messages();
         self.realtime.poll_messages();
-
-        // 检查 clamd 守护进程状态
-        self.scan_engine.clamd_daemon.check_status();
 
         // Request repaint while scanning/updating/realtime
         if self.scan_engine.state == ScanState::Scanning

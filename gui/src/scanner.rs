@@ -1,109 +1,9 @@
 use crate::config::AppConfig;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-
-/// Clamd 守护进程管理器
-pub struct ClamdDaemon {
-    process: Option<Child>,
-    pub is_running: bool,
-}
-
-impl ClamdDaemon {
-    pub fn new() -> Self {
-        Self {
-            process: None,
-            is_running: false,
-        }
-    }
-
-    /// 启动 clamd 守护进程
-    pub fn start(&mut self, config: &AppConfig) -> Result<(), String> {
-        if self.is_running {
-            return Ok(());
-        }
-
-        let clamd_path = config.clamd_path();
-        if !clamd_path.exists() {
-            return Err(format!("clamd.exe 未找到: {}", clamd_path.display()));
-        }
-
-        // 生成 clamd.conf 配置文件
-        if let Err(e) = config.generate_clamd_conf() {
-            return Err(format!("生成 clamd.conf 失败: {}", e));
-        }
-
-        let conf_path = config.clamd_conf_path();
-
-        let mut cmd = Command::new(&clamd_path);
-        cmd.arg("-c").arg(&conf_path);
-        cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::null());
-
-        // 隐藏窗口
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        }
-
-        match cmd.spawn() {
-            Ok(child) => {
-                self.process = Some(child);
-                self.is_running = true;
-                
-                // 等待 clamd 初始化（加载病毒库需要几秒）
-                std::thread::sleep(std::time::Duration::from_secs(3));
-                
-                Ok(())
-            }
-            Err(e) => Err(format!("启动 clamd 失败: {}", e)),
-        }
-    }
-
-    /// 停止 clamd 守护进程
-    pub fn stop(&mut self) {
-        if let Some(mut child) = self.process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        self.is_running = false;
-    }
-
-    /// 检查 clamd 是否正在运行
-    pub fn check_status(&mut self) -> bool {
-        if let Some(ref mut child) = self.process {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    // 进程已退出
-                    self.process = None;
-                    self.is_running = false;
-                    false
-                }
-                Ok(None) => {
-                    // 进程仍在运行
-                    true
-                }
-                Err(_) => {
-                    self.is_running = false;
-                    false
-                }
-            }
-        } else {
-            self.is_running = false;
-            false
-        }
-    }
-}
-
-impl Drop for ClamdDaemon {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
 
 #[derive(Clone, Debug)]
 pub enum ScanMessage {
@@ -144,7 +44,6 @@ pub struct ScanEngine {
     pub cancel_flag: Arc<Mutex<bool>>,
     pub current_file: String,
     pub scan_started_at: Option<std::time::Instant>,
-    pub clamd_daemon: ClamdDaemon,
     scan_child_id: Arc<Mutex<Option<u32>>>,
 }
 
@@ -159,7 +58,6 @@ impl Default for ScanEngine {
             cancel_flag: Arc::new(Mutex::new(false)),
             current_file: String::new(),
             scan_started_at: None,
-            clamd_daemon: ClamdDaemon::new(),
             scan_child_id: Arc::new(Mutex::new(None)),
         }
     }
@@ -182,20 +80,6 @@ impl ScanEngine {
             return;
         }
 
-        // 确保 clamd 守护进程正在运行
-        if !self.clamd_daemon.is_running {
-            self.log_lines.push("INFO: 启动 ClamAV 守护进程...".to_string());
-            match self.clamd_daemon.start(config) {
-                Ok(_) => {
-                    self.log_lines.push("INFO: ClamAV 守护进程已启动（使用高性能模式）".to_string());
-                }
-                Err(e) => {
-                    self.log_lines.push(format!("ERROR: 启动 clamd 失败: {}", e));
-                    self.log_lines.push("INFO: 回退到传统扫描模式...".to_string());
-                }
-            }
-        }
-
         self.state = ScanState::Scanning;
         self.threats.clear();
         self.stats = ScanStats::default();
@@ -209,13 +93,8 @@ impl ScanEngine {
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
 
-        // 优先使用 clamdscan（高性能），如果不可用则使用 clamscan
-        let use_daemon = self.clamd_daemon.is_running && config.clamdscan_path().exists();
-        let scanner_path = if use_daemon {
-            config.clamdscan_path()
-        } else {
-            config.clamscan_path()
-        };
+        // 始终使用 clamscan 进程模式（可靠地收集性能统计）
+        let scanner_path = config.clamscan_path();
 
         let db_dir = config.database_dir.clone();
         let recursive = config.recursive_scan;
@@ -227,7 +106,6 @@ impl ScanEngine {
         std::thread::spawn(move || {
             run_scanner(
                 scanner_path,
-                use_daemon,
                 targets,
                 db_dir,
                 recursive,
@@ -323,7 +201,6 @@ impl Drop for ScanEngine {
                 kill_process_tree(id);
             }
         }
-        // clamd_daemon is dropped automatically via its own Drop impl
     }
 }
 
@@ -348,205 +225,8 @@ fn kill_process_tree(pid: u32) {
     }
 }
 
+/// 通过 clamscan 子进程执行扫描
 fn run_scanner(
-    scanner_path: PathBuf,
-    use_daemon: bool,
-    targets: Vec<PathBuf>,
-    db_dir: PathBuf,
-    recursive: bool,
-    max_size_mb: u64,
-    scan_archives: bool,
-    excludes: Vec<String>,
-    cancel: Arc<Mutex<bool>>,
-    scan_child_id: Arc<Mutex<Option<u32>>>,
-    tx: mpsc::Sender<ScanMessage>,
-) {
-    if use_daemon {
-        // 直接通过 TCP 连接 clamd 守护进程（绕过 clamdscan 的 OK 输出过滤问题）
-        run_scanner_via_socket(targets, recursive, cancel, tx);
-    } else {
-        // 独立模式：使用 clamscan 进程
-        run_scanner_via_process(
-            scanner_path, targets, db_dir, recursive, max_size_mb,
-            scan_archives, excludes, cancel, scan_child_id, tx,
-        );
-    }
-}
-
-/// 通过 TCP 套接字直接与 clamd 守护进程通信扫描
-/// clamd 对每个文件返回 "filepath: OK\0" 或 "filepath: VirusName FOUND\0"
-/// 这解决了 clamdscan 吞掉 OK 输出导致无法统计的问题
-fn run_scanner_via_socket(
-    targets: Vec<PathBuf>,
-    recursive: bool,
-    cancel: Arc<Mutex<bool>>,
-    tx: mpsc::Sender<ScanMessage>,
-) {
-    let start = std::time::Instant::now();
-    let mut scanned: u64 = 0;
-    let mut infected: u64 = 0;
-    let mut last_stats_update = std::time::Instant::now();
-
-    for target in &targets {
-        let is_cancelled = cancel.lock().map(|f| *f).unwrap_or(false);
-        if is_cancelled {
-            break;
-        }
-
-        let mut stream = match TcpStream::connect("127.0.0.1:3310") {
-            Ok(s) => {
-                // Set read timeout so cancel flag can be checked periodically
-                let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-                s
-            }
-            Err(e) => {
-                let _ = tx.send(ScanMessage::Error(format!(
-                    "无法连接 clamd 守护进程 (127.0.0.1:3310): {}", e
-                )));
-                return;
-            }
-        };
-
-        // 发送扫描命令（z 前缀 = null-terminated 协议）
-        // CONTSCAN: 递归扫描，遇到病毒继续扫描
-        // MULTISCAN: 递归多线程扫描
-        let cmd_name = if recursive { "MULTISCAN" } else { "CONTSCAN" };
-        let target_str = target.to_string_lossy();
-        let cmd = format!("z{} {}", cmd_name, target_str);
-
-        if let Err(e) = stream.write_all(cmd.as_bytes()) {
-            let _ = tx.send(ScanMessage::Error(format!("发送扫描命令失败: {}", e)));
-            return;
-        }
-        // Write null terminator
-        if let Err(e) = stream.write_all(&[0u8]) {
-            let _ = tx.send(ScanMessage::Error(format!("发送扫描命令失败: {}", e)));
-            return;
-        }
-
-        // 读取 clamd 响应（null-terminated 行）
-        let mut buf = Vec::with_capacity(4096);
-        let mut byte = [0u8; 1];
-        loop {
-            let is_cancelled = cancel.lock().map(|f| *f).unwrap_or(false);
-            if is_cancelled {
-                break;
-            }
-
-            match stream.read(&mut byte) {
-                Ok(0) => break, // EOF
-                Ok(_) => {
-                    if byte[0] == 0 {
-                        // Null terminator = end of one response line
-                        let line = String::from_utf8_lossy(&buf).to_string();
-                        buf.clear();
-
-                        if line.trim().is_empty() {
-                            continue;
-                        }
-
-                        if line.contains("FOUND") {
-                            infected += 1;
-                            scanned += 1;
-                            // Format: "filepath: VirusName FOUND"
-                            if let Some(colon_pos) = line.rfind(": ") {
-                                let file_path = line[..colon_pos].trim().to_string();
-                                let rest = line[colon_pos + 2..].trim();
-                                let threat_name = rest.trim_end_matches("FOUND").trim().to_string();
-                                let _ = tx.send(ScanMessage::ThreatFound(ThreatInfo {
-                                    file_path: file_path.clone(),
-                                    threat_name,
-                                }));
-                                let _ = tx.send(ScanMessage::Progress(file_path));
-                            }
-                        } else if line.contains(": OK") {
-                            scanned += 1;
-                            if let Some(path) = line.split(": OK").next() {
-                                let path = path.trim();
-                                if !path.is_empty() {
-                                    let _ = tx.send(ScanMessage::Progress(path.to_string()));
-                                }
-                            }
-                        } else if line.contains("ERROR") {
-                            // clamd error for a specific file, log but continue
-                            let _ = tx.send(ScanMessage::Progress(line.clone()));
-                        }
-
-                        // Throttled stats update
-                        if last_stats_update.elapsed().as_secs_f64() > 1.0 {
-                            let _ = tx.send(ScanMessage::Stats(ScanStats {
-                                scanned_files: scanned,
-                                infected_files: infected,
-                                scanned_data_mb: 0.0,
-                                elapsed_secs: start.elapsed().as_secs_f64(),
-                            }));
-                            last_stats_update = std::time::Instant::now();
-                        }
-                    } else {
-                        buf.push(byte[0]);
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut
-                    || e.kind() == std::io::ErrorKind::WouldBlock =>
-                {
-                    // Read timeout - just loop back to check cancel flag
-                    continue;
-                }
-                Err(e) => {
-                    let _ = tx.send(ScanMessage::Error(format!("读取 clamd 响应失败: {}", e)));
-                    break;
-                }
-            }
-        }
-        // Process remaining data in buffer (if clamd doesn't null-terminate last line)
-        if !buf.is_empty() {
-            let line = String::from_utf8_lossy(&buf).to_string();
-            if line.contains("FOUND") {
-                infected += 1;
-                scanned += 1;
-                if let Some(colon_pos) = line.rfind(": ") {
-                    let file_path = line[..colon_pos].trim().to_string();
-                    let rest = line[colon_pos + 2..].trim();
-                    let threat_name = rest.trim_end_matches("FOUND").trim().to_string();
-                    let _ = tx.send(ScanMessage::ThreatFound(ThreatInfo {
-                        file_path: file_path.clone(),
-                        threat_name,
-                    }));
-                }
-            } else if line.contains(": OK") {
-                scanned += 1;
-            }
-        }
-    }
-
-    let was_cancelled = cancel.lock().map(|f| *f).unwrap_or(false);
-    if was_cancelled {
-        let _ = tx.send(ScanMessage::Finished(ScanStats {
-            scanned_files: scanned,
-            infected_files: infected,
-            scanned_data_mb: 0.0,
-            elapsed_secs: start.elapsed().as_secs_f64(),
-        }));
-        return;
-    }
-
-    let _ = tx.send(ScanMessage::Stats(ScanStats {
-        scanned_files: scanned,
-        infected_files: infected,
-        scanned_data_mb: 0.0,
-        elapsed_secs: start.elapsed().as_secs_f64(),
-    }));
-
-    let _ = tx.send(ScanMessage::Finished(ScanStats {
-        scanned_files: scanned,
-        infected_files: infected,
-        scanned_data_mb: 0.0,
-        elapsed_secs: start.elapsed().as_secs_f64(),
-    }));
-}
-
-/// 通过 clamscan 子进程执行扫描（独立模式）
-fn run_scanner_via_process(
     scanner_path: PathBuf,
     targets: Vec<PathBuf>,
     db_dir: PathBuf,

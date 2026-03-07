@@ -116,20 +116,8 @@ impl AppConfig {
         self.clamav_dir.join("clamscan.exe")
     }
 
-    pub fn clamdscan_path(&self) -> PathBuf {
-        self.clamav_dir.join("clamdscan.exe")
-    }
-
-    pub fn clamd_path(&self) -> PathBuf {
-        self.clamav_dir.join("clamd.exe")
-    }
-
     pub fn freshclam_path(&self) -> PathBuf {
         self.clamav_dir.join("freshclam.exe")
-    }
-
-    pub fn clamd_conf_path(&self) -> PathBuf {
-        self.clamav_dir.join("clamd.conf")
     }
 
     /// 应用快速扫描预设（牺牲一定准确性换取速度）
@@ -154,72 +142,6 @@ impl AppConfig {
         self.scan_archives = true;
         self.scan_mail = true;
         self.heuristic_alerts = true;
-    }
-
-    /// 生成 clamd.conf 配置文件
-    pub fn generate_clamd_conf(&self) -> std::io::Result<()> {
-        let conf_path = self.clamd_conf_path();
-        let content = format!(
-r#"# ClamAV Daemon 配置文件由 GUI 自动生成
-# 不要手动编辑此文件 - 将被覆盖
-
-# TCP Socket 配置
-TCPSocket 3310
-TCPAddr 127.0.0.1
-
-# 数据库目录
-DatabaseDirectory {}
-
-# 日志文件
-LogFile {}
-LogTime yes
-LogFileMaxSize 10M
-
-# 性能配置
-MaxThreads {}
-MaxQueue 100
-MaxDirectoryRecursion 15
-
-# 文件扫描限制
-MaxFileSize {}M
-MaxScanSize {}M
-StreamMaxLength {}M
-
-# 扫描选项
-ScanPE yes
-ScanELF yes
-ScanMail {}
-ScanArchive {}
-ScanOLE2 {}
-ScanPDF {}
-ScanHTML {}
-ScanSWF yes
-
-# 启发式检测
-HeuristicAlerts {}
-HeuristicScanPrecedence yes
-
-# 其他选项
-DetectPUA no
-ExcludePUA .Win.Packer
-AlgorithmicDetection yes
-"#,
-            self.database_dir.display().to_string().replace("\\", "/"),
-            self.log_dir.join("clamd.log").display().to_string().replace("\\", "/"),
-            self.max_scan_threads,
-            self.max_file_size_mb,
-            self.max_file_size_mb * 4,
-            self.max_file_size_mb,
-            if self.scan_mail { "yes" } else { "no" },
-            if self.scan_archives { "yes" } else { "no" },
-            if self.scan_ole2 { "yes" } else { "no" },
-            if self.scan_pdf { "yes" } else { "no" },
-            if self.scan_html { "yes" } else { "no" },
-            if self.heuristic_alerts { "yes" } else { "no" },
-        );
-
-        std::fs::write(&conf_path, content)?;
-        Ok(())
     }
 
     pub fn freshclam_conf_path(&self) -> PathBuf {
