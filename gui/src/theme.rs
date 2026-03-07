@@ -18,14 +18,66 @@ const BG_LIGHT: Color32 = Color32::from_rgb(250, 250, 250);
 const BG_PANEL_LIGHT: Color32 = Color32::from_rgb(245, 245, 245);
 const BG_CARD_LIGHT: Color32 = Color32::from_rgb(255, 255, 255);
 const TEXT_PRIMARY_LIGHT: Color32 = Color32::from_rgb(33, 33, 33);
+const TEXT_SECONDARY_LIGHT: Color32 = Color32::from_rgb(96, 96, 96);
 const HOVERED_LIGHT: Color32 = Color32::from_rgb(240, 240, 240);
 
 pub const SIDEBAR_WIDTH: f32 = 200.0;
 
-pub const BG_PANEL: Color32 = BG_PANEL_DARK;
-pub const BG_CARD: Color32 = BG_CARD_DARK;
-pub const TEXT_PRIMARY: Color32 = TEXT_PRIMARY_DARK;
-pub const TEXT_SECONDARY: Color32 = TEXT_SECONDARY_DARK;
+pub fn bg_panel(dark_mode: bool) -> Color32 {
+    if dark_mode { BG_PANEL_DARK } else { BG_PANEL_LIGHT }
+}
+
+pub fn bg_card(dark_mode: bool) -> Color32 {
+    if dark_mode { BG_CARD_DARK } else { BG_CARD_LIGHT }
+}
+
+pub fn text_primary(dark_mode: bool) -> Color32 {
+    if dark_mode { TEXT_PRIMARY_DARK } else { TEXT_PRIMARY_LIGHT }
+}
+
+pub fn text_secondary(dark_mode: bool) -> Color32 {
+    if dark_mode { TEXT_SECONDARY_DARK } else { TEXT_SECONDARY_LIGHT }
+}
+
+pub fn border_color(dark_mode: bool) -> Color32 {
+    if dark_mode {
+        Color32::from_rgb(55, 55, 55)
+    } else {
+        Color32::from_rgb(210, 210, 210)
+    }
+}
+
+pub fn success_surface(dark_mode: bool) -> Color32 {
+    if dark_mode {
+        Color32::from_rgb(30, 60, 50)
+    } else {
+        Color32::from_rgb(228, 245, 233)
+    }
+}
+
+pub fn warning_surface(dark_mode: bool) -> Color32 {
+    if dark_mode {
+        Color32::from_rgb(50, 35, 20)
+    } else {
+        Color32::from_rgb(255, 243, 224)
+    }
+}
+
+pub fn danger_surface(dark_mode: bool) -> Color32 {
+    if dark_mode {
+        Color32::from_rgb(60, 30, 30)
+    } else {
+        Color32::from_rgb(255, 235, 238)
+    }
+}
+
+pub fn info_surface(dark_mode: bool) -> Color32 {
+    if dark_mode {
+        Color32::from_rgb(40, 40, 50)
+    } else {
+        Color32::from_rgb(238, 242, 246)
+    }
+}
 
 pub fn apply_theme(ctx: &egui::Context, dark_mode: bool) {
     let mut style = Style::default();

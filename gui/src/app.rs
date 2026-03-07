@@ -59,6 +59,7 @@ impl ClamAvApp {
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
+        let dark_mode = ui.visuals().dark_mode;
         ui.vertical(|ui| {
             ui.add_space(16.0);
 
@@ -72,7 +73,7 @@ impl ClamAvApp {
                 ui.label(
                     egui::RichText::new("Antivirus Scanner")
                         .font(FontId::proportional(12.0))
-                        .color(theme::TEXT_SECONDARY),
+                        .color(theme::text_secondary(dark_mode)),
                 );
             });
 
@@ -100,7 +101,7 @@ impl ClamAvApp {
                             .color(if selected {
                                 Color32::WHITE
                             } else {
-                                theme::TEXT_SECONDARY
+                                theme::text_secondary(dark_mode)
                             }),
                     )
                     .fill(if selected {
@@ -121,13 +122,14 @@ impl ClamAvApp {
                 ui.label(
                     egui::RichText::new("v1.0.0")
                         .font(FontId::proportional(11.0))
-                        .color(theme::TEXT_SECONDARY),
+                        .color(theme::text_secondary(dark_mode)),
                 );
             });
         });
     }
 
     fn dashboard_panel(&mut self, ui: &mut egui::Ui) {
+        let dark_mode = ui.visuals().dark_mode;
         ui.add_space(12.0);
         ui.label(theme::heading("仪表板"));
         ui.add_space(12.0);
@@ -138,10 +140,7 @@ impl ClamAvApp {
             cols[0].vertical_centered(|ui| {
                 let clamscan_exists = self.config.clamscan_path().exists();
                 enhanced_card(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(if clamscan_exists { "⚙️" } else { "❌" })
-                            .font(FontId::proportional(32.0)),
-                    );
+                    status_icon(ui, if clamscan_exists { "⚙" } else { "✖" });
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(if clamscan_exists { "就绪" } else { "未找到" })
@@ -159,10 +158,7 @@ impl ClamAvApp {
             cols[1].vertical_centered(|ui| {
                 let rt_on = self.realtime.state == RealtimeState::Running;
                 enhanced_card(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(if rt_on { "🛡️" } else { "⚠️" })
-                            .font(FontId::proportional(32.0)),
-                    );
+                    status_icon(ui, if rt_on { "🛡" } else { "⚠" });
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(if rt_on { "已启用" } else { "未启用" })
@@ -180,10 +176,7 @@ impl ClamAvApp {
             cols[2].vertical_centered(|ui| {
                 let has_db = self.updater.db_version.is_some();
                 enhanced_card(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(if has_db { "📚" } else { "⚠️" })
-                            .font(FontId::proportional(32.0)),
-                    );
+                    status_icon(ui, if has_db { "📚" } else { "⚠" });
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(if has_db { "已加载" } else { "未配置" })
@@ -201,10 +194,7 @@ impl ClamAvApp {
             cols[3].vertical_centered(|ui| {
                 let threat_count = self.scan_engine.threats.len() + self.realtime.threats.len();
                 enhanced_card(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(if threat_count == 0 { "✅" } else { "⚠️" })
-                            .font(FontId::proportional(32.0)),
-                    );
+                    status_icon(ui, if threat_count == 0 { "✓" } else { "⚠" });
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(threat_count.to_string())
@@ -278,7 +268,7 @@ impl ClamAvApp {
 
         if self.scan_engine.threats.is_empty() && self.realtime.threats.is_empty() {
             egui::Frame::new()
-                .fill(Color32::from_rgb(30, 60, 50))
+                .fill(theme::success_surface(dark_mode))
                 .corner_radius(CornerRadius::same(8))
                 .inner_margin(egui::Margin::same(16))
                 .show(ui, |ui| {
@@ -315,7 +305,7 @@ impl ClamAvApp {
                     
                     for threat in all_threats.iter().take(20) {
                         egui::Frame::new()
-                            .fill(Color32::from_rgb(60, 30, 30))
+                            .fill(theme::danger_surface(dark_mode))
                             .corner_radius(CornerRadius::same(6))
                             .inner_margin(egui::Margin::same(10))
                             .show(ui, |ui| {
@@ -379,6 +369,7 @@ impl ClamAvApp {
     }
 
     fn scan_panel(&mut self, ui: &mut egui::Ui) {
+        let dark_mode = ui.visuals().dark_mode;
         let panel_width = ui.available_width();
 
         ui.add_space(12.0);
@@ -389,7 +380,7 @@ impl ClamAvApp {
         ui.label(
             egui::RichText::new("扫描目标")
                 .font(FontId::proportional(13.0))
-                .color(theme::TEXT_SECONDARY),
+                .color(theme::text_secondary(dark_mode)),
         );
         ui.add_space(4.0);
         ui.add_sized(
@@ -453,53 +444,53 @@ impl ClamAvApp {
         ui.columns(4, |cols| {
             cols[0].vertical_centered(|ui| {
                 egui::Frame::new()
-                    .fill(theme::BG_CARD)
+                    .fill(theme::bg_card(dark_mode))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(egui::Margin::same(12))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(55, 55, 55)))
+                    .stroke(Stroke::new(1.0, theme::border_color(dark_mode)))
                     .show(ui, |ui| {
                         ui.vertical_centered(|ui| {
-                            ui.label(egui::RichText::new(&scanned).font(FontId::proportional(26.0)).color(theme::TEXT_PRIMARY));
-                            ui.label(egui::RichText::new("已扫描").font(FontId::proportional(13.0)).color(theme::TEXT_SECONDARY));
+                            ui.label(egui::RichText::new(&scanned).font(FontId::proportional(26.0)).color(theme::text_primary(dark_mode)));
+                            ui.label(egui::RichText::new("已扫描").font(FontId::proportional(13.0)).color(theme::text_secondary(dark_mode)));
                         });
                     });
             });
             cols[1].vertical_centered(|ui| {
                 egui::Frame::new()
-                    .fill(theme::BG_CARD)
+                    .fill(theme::bg_card(dark_mode))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(egui::Margin::same(12))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(55, 55, 55)))
+                    .stroke(Stroke::new(1.0, theme::border_color(dark_mode)))
                     .show(ui, |ui| {
                         ui.vertical_centered(|ui| {
                             ui.label(egui::RichText::new(&infected).font(FontId::proportional(26.0)).color(infected_color));
-                            ui.label(egui::RichText::new("已感染").font(FontId::proportional(13.0)).color(theme::TEXT_SECONDARY));
+                            ui.label(egui::RichText::new("已感染").font(FontId::proportional(13.0)).color(theme::text_secondary(dark_mode)));
                         });
                     });
             });
             cols[2].vertical_centered(|ui| {
                 egui::Frame::new()
-                    .fill(theme::BG_CARD)
+                    .fill(theme::bg_card(dark_mode))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(egui::Margin::same(12))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(55, 55, 55)))
+                    .stroke(Stroke::new(1.0, theme::border_color(dark_mode)))
                     .show(ui, |ui| {
                         ui.vertical_centered(|ui| {
-                            ui.label(egui::RichText::new(&scanned_data).font(FontId::proportional(26.0)).color(theme::TEXT_PRIMARY));
-                            ui.label(egui::RichText::new("扫描数据").font(FontId::proportional(13.0)).color(theme::TEXT_SECONDARY));
+                            ui.label(egui::RichText::new(&scanned_data).font(FontId::proportional(26.0)).color(theme::text_primary(dark_mode)));
+                            ui.label(egui::RichText::new("扫描数据").font(FontId::proportional(13.0)).color(theme::text_secondary(dark_mode)));
                         });
                     });
             });
             cols[3].vertical_centered(|ui| {
                 egui::Frame::new()
-                    .fill(theme::BG_CARD)
+                    .fill(theme::bg_card(dark_mode))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(egui::Margin::same(12))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(55, 55, 55)))
+                    .stroke(Stroke::new(1.0, theme::border_color(dark_mode)))
                     .show(ui, |ui| {
                         ui.vertical_centered(|ui| {
-                            ui.label(egui::RichText::new(&elapsed).font(FontId::proportional(26.0)).color(theme::TEXT_PRIMARY));
-                            ui.label(egui::RichText::new("用时").font(FontId::proportional(13.0)).color(theme::TEXT_SECONDARY));
+                            ui.label(egui::RichText::new(&elapsed).font(FontId::proportional(26.0)).color(theme::text_primary(dark_mode)));
+                            ui.label(egui::RichText::new("用时").font(FontId::proportional(13.0)).color(theme::text_secondary(dark_mode)));
                         });
                     });
             });
@@ -511,7 +502,7 @@ impl ClamAvApp {
         if self.scan_engine.state == ScanState::Scanning {
             ui.add_space(4.0);
             egui::Frame::new()
-                .fill(Color32::from_rgb(40, 40, 50))
+                .fill(theme::info_surface(dark_mode))
                 .corner_radius(CornerRadius::same(6))
                 .inner_margin(egui::Margin::same(10))
                 .show(ui, |ui| {
@@ -522,12 +513,12 @@ impl ClamAvApp {
                             ui.label(
                                 egui::RichText::new("正在扫描")
                                     .font(FontId::proportional(11.0))
-                                    .color(theme::TEXT_SECONDARY),
+                                    .color(theme::text_secondary(dark_mode)),
                             );
                             ui.label(
                                 egui::RichText::new(&self.scan_engine.current_file)
                                     .font(FontId::proportional(10.0))
-                                    .color(Color32::from_rgb(150, 150, 150)),
+                                    .color(theme::text_secondary(dark_mode)),
                             );
                         });
                     });
@@ -563,7 +554,7 @@ impl ClamAvApp {
             let quarantine_dir = self.config.quarantine_dir.clone();
             for threat in &threats {
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(50, 30, 30))
+                    .fill(theme::danger_surface(dark_mode))
                     .corner_radius(CornerRadius::same(6))
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
@@ -582,7 +573,7 @@ impl ClamAvApp {
                                 ui.label(
                                     egui::RichText::new(&threat.file_path)
                                         .font(FontId::proportional(11.0))
-                                        .color(theme::TEXT_SECONDARY),
+                                        .color(theme::text_secondary(dark_mode)),
                                 );
                             });
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -598,6 +589,7 @@ impl ClamAvApp {
     }
 
     fn realtime_panel(&mut self, ui: &mut egui::Ui) {
+        let dark_mode = ui.visuals().dark_mode;
         ui.add_space(12.0);
         ui.label(theme::heading("实时保护"));
         ui.add_space(12.0);
@@ -606,9 +598,9 @@ impl ClamAvApp {
         let is_running = self.realtime.state == RealtimeState::Running;
         egui::Frame::new()
             .fill(if is_running {
-                Color32::from_rgb(20, 50, 40)
+                theme::success_surface(dark_mode)
             } else {
-                Color32::from_rgb(50, 35, 20)
+                theme::warning_surface(dark_mode)
             })
             .corner_radius(CornerRadius::same(10))
             .inner_margin(egui::Margin::same(16))
@@ -635,7 +627,7 @@ impl ClamAvApp {
                                 "点击下方按钮开启实时保护"
                             })
                             .font(FontId::proportional(12.0))
-                            .color(theme::TEXT_SECONDARY),
+                            .color(theme::text_secondary(dark_mode)),
                         );
                     });
                 });
@@ -686,7 +678,7 @@ impl ClamAvApp {
                 ui.label(
                     egui::RichText::new(dir.to_string_lossy())
                         .font(FontId::proportional(12.0))
-                        .color(theme::TEXT_PRIMARY),
+                        .color(theme::text_primary(dark_mode)),
                 );
             });
         }
@@ -713,31 +705,31 @@ impl ClamAvApp {
         ui.columns(2, |cols| {
             cols[0].vertical_centered(|ui| {
                 egui::Frame::new()
-                    .fill(theme::BG_CARD)
+                    .fill(theme::bg_card(dark_mode))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(egui::Margin::same(12))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(55, 55, 55)))
+                    .stroke(Stroke::new(1.0, theme::border_color(dark_mode)))
                     .show(ui, |ui| {
                         ui.vertical_centered(|ui| {
                             ui.label(
                                 egui::RichText::new(&self.realtime.scanned_count.to_string())
                                     .font(FontId::proportional(26.0))
-                                    .color(theme::TEXT_PRIMARY),
+                                    .color(theme::text_primary(dark_mode)),
                             );
                             ui.label(
                                 egui::RichText::new("已扫描文件")
                                     .font(FontId::proportional(13.0))
-                                    .color(theme::TEXT_SECONDARY),
+                                    .color(theme::text_secondary(dark_mode)),
                             );
                         });
                     });
             });
             cols[1].vertical_centered(|ui| {
                 egui::Frame::new()
-                    .fill(theme::BG_CARD)
+                    .fill(theme::bg_card(dark_mode))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(egui::Margin::same(12))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(55, 55, 55)))
+                    .stroke(Stroke::new(1.0, theme::border_color(dark_mode)))
                     .show(ui, |ui| {
                         ui.vertical_centered(|ui| {
                             let count = self.realtime.threats.len();
@@ -749,7 +741,7 @@ impl ClamAvApp {
                             ui.label(
                                 egui::RichText::new("发现威胁")
                                     .font(FontId::proportional(13.0))
-                                    .color(theme::TEXT_SECONDARY),
+                                    .color(theme::text_secondary(dark_mode)),
                             );
                         });
                     });
@@ -771,7 +763,7 @@ impl ClamAvApp {
                 .show(ui, |ui| {
                     for threat in self.realtime.threats.iter().rev().take(50) {
                         egui::Frame::new()
-                            .fill(Color32::from_rgb(50, 30, 30))
+                            .fill(theme::danger_surface(dark_mode))
                             .corner_radius(CornerRadius::same(6))
                             .inner_margin(egui::Margin::same(6))
                             .show(ui, |ui| {
@@ -788,7 +780,7 @@ impl ClamAvApp {
                                         ui.label(
                                             egui::RichText::new(format!("{} - {}", threat.timestamp, threat.file_path))
                                                 .font(FontId::proportional(11.0))
-                                                .color(theme::TEXT_SECONDARY),
+                                                .color(theme::text_secondary(dark_mode)),
                                         );
                                     });
                                 });
@@ -811,7 +803,7 @@ impl ClamAvApp {
                         let color = if line.contains("THREAT") {
                             theme::DANGER
                         } else {
-                            theme::TEXT_SECONDARY
+                            theme::text_secondary(dark_mode)
                         };
                         ui.label(
                             egui::RichText::new(line)
@@ -824,6 +816,7 @@ impl ClamAvApp {
     }
 
     fn update_panel(&mut self, ui: &mut egui::Ui) {
+        let dark_mode = ui.visuals().dark_mode;
         ui.add_space(12.0);
         ui.label(theme::heading("病毒库更新"));
         ui.add_space(12.0);
@@ -840,7 +833,7 @@ impl ClamAvApp {
                 ui.label(
                     egui::RichText::new(ver)
                         .font(FontId::proportional(13.0))
-                        .color(theme::TEXT_PRIMARY),
+                        .color(theme::text_primary(dark_mode)),
                 );
             });
             card(ui, 250.0, |ui| {
@@ -853,7 +846,7 @@ impl ClamAvApp {
                 ui.label(
                     egui::RichText::new(ts)
                         .font(FontId::proportional(13.0))
-                        .color(theme::TEXT_PRIMARY),
+                        .color(theme::text_primary(dark_mode)),
                 );
             });
         });
@@ -890,7 +883,7 @@ impl ClamAvApp {
                         ui.label(
                             egui::RichText::new(line)
                                 .font(FontId::monospace(12.0))
-                                .color(theme::TEXT_SECONDARY),
+                                .color(theme::text_secondary(dark_mode)),
                         );
                     }
                 });
@@ -898,6 +891,7 @@ impl ClamAvApp {
     }
 
     fn quarantine_panel(&mut self, ui: &mut egui::Ui) {
+        let dark_mode = ui.visuals().dark_mode;
         ui.add_space(12.0);
         ui.label(theme::heading("隔离区"));
         ui.add_space(8.0);
@@ -908,7 +902,7 @@ impl ClamAvApp {
                 self.config.quarantine_dir.display()
             ))
             .font(FontId::proportional(12.0))
-            .color(theme::TEXT_SECONDARY),
+            .color(theme::text_secondary(dark_mode)),
         );
 
         ui.add_space(8.0);
@@ -963,12 +957,12 @@ impl ClamAvApp {
                             ui.label(
                                 egui::RichText::new(&name)
                                     .font(FontId::proportional(13.0))
-                                    .color(theme::TEXT_PRIMARY),
+                                    .color(theme::text_primary(dark_mode)),
                             );
                             ui.label(
                                 egui::RichText::new(size)
                                     .font(FontId::proportional(12.0))
-                                    .color(theme::TEXT_SECONDARY),
+                                    .color(theme::text_secondary(dark_mode)),
                             );
                             if ui.add(theme::danger_button("🗑 删除")).clicked() {
                                 let _ = std::fs::remove_file(entry.path());
@@ -1069,6 +1063,7 @@ impl ClamAvApp {
     }
 
     fn log_panel(&mut self, ui: &mut egui::Ui) {
+        let dark_mode = ui.visuals().dark_mode;
         ui.add_space(12.0);
         ui.label(theme::heading("扫描日志"));
         ui.add_space(8.0);
@@ -1080,7 +1075,7 @@ impl ClamAvApp {
             ui.label(
                 egui::RichText::new(format!("{} 条记录", self.scan_engine.log_lines.len()))
                     .font(FontId::proportional(12.0))
-                    .color(theme::TEXT_SECONDARY),
+                    .color(theme::text_secondary(dark_mode)),
             );
         });
 
@@ -1095,7 +1090,7 @@ impl ClamAvApp {
                     } else if line.contains("ERROR") {
                         theme::WARNING
                     } else {
-                        theme::TEXT_SECONDARY
+                        theme::text_secondary(dark_mode)
                     };
                     ui.label(
                         egui::RichText::new(line)
@@ -1145,7 +1140,7 @@ impl eframe::App for ClamAvApp {
                 ui.painter().rect_filled(
                     ui.max_rect(),
                     CornerRadius::ZERO,
-                    theme::BG_PANEL,
+                    theme::bg_panel(ctx.style().visuals.dark_mode),
                 );
                 self.sidebar(ui);
             });
@@ -1169,11 +1164,12 @@ impl eframe::App for ClamAvApp {
 }
 
 fn card(ui: &mut egui::Ui, width: f32, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let dark_mode = ui.visuals().dark_mode;
     egui::Frame::new()
-        .fill(theme::BG_CARD)
+        .fill(theme::bg_card(dark_mode))
         .corner_radius(CornerRadius::same(10))
         .inner_margin(egui::Margin::same(14))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(55, 55, 55)))
+        .stroke(Stroke::new(1.0, theme::border_color(dark_mode)))
         .show(ui, |ui| {
             ui.set_min_width(width);
             add_contents(ui);
@@ -1181,8 +1177,9 @@ fn card(ui: &mut egui::Ui, width: f32, add_contents: impl FnOnce(&mut egui::Ui))
 }
 
 fn enhanced_card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui), accent_color: Color32) {
+    let dark_mode = ui.visuals().dark_mode;
     egui::Frame::new()
-        .fill(theme::BG_CARD)
+        .fill(theme::bg_card(dark_mode))
         .corner_radius(CornerRadius::same(12))
         .inner_margin(egui::Margin::same(16))
         .stroke(Stroke::new(2.0, accent_color.gamma_multiply(0.3)))
@@ -1193,27 +1190,49 @@ fn enhanced_card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui), ac
         });
 }
 
+fn status_icon(ui: &mut egui::Ui, icon: &str) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), 42.0),
+        egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+        |ui| {
+            ui.label(
+                egui::RichText::new(icon)
+                    .font(FontId::proportional(32.0)),
+            );
+        },
+    );
+}
+
 fn stat_card(ui: &mut egui::Ui, icon: &str, value: &str, label: &str) {
+    let dark_mode = ui.visuals().dark_mode;
     egui::Frame::new()
-        .fill(theme::BG_CARD)
+        .fill(theme::bg_card(dark_mode))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(egui::Margin::same(12))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(55, 55, 55)))
+        .stroke(Stroke::new(1.0, theme::border_color(dark_mode)))
         .show(ui, |ui| {
             ui.vertical_centered(|ui| {
-                ui.label(
-                    egui::RichText::new(icon)
-                        .font(FontId::proportional(20.0)),
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 28.0),
+                    egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new(icon)
+                                .font(FontId::proportional(20.0)),
+                        );
+                    },
                 );
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(value)
                         .font(FontId::proportional(18.0))
+                        .color(theme::text_primary(dark_mode))
                         .strong(),
                 );
                 ui.label(
                     egui::RichText::new(label)
-                        .font(FontId::proportional(10.0)),
+                        .font(FontId::proportional(10.0))
+                        .color(theme::text_secondary(dark_mode)),
                 );
             });
         });
