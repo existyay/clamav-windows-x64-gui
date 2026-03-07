@@ -30,7 +30,6 @@ pub struct ClamAvApp {
     settings_max_size: String,
     settings_threads: String,
     settings_exclude: String,
-    settings_clamav_dir: String,
 }
 
 impl ClamAvApp {
@@ -41,7 +40,6 @@ impl ClamAvApp {
         let settings_max_size = config.max_file_size_mb.to_string();
         let settings_threads = config.max_scan_threads.to_string();
         let settings_exclude = config.exclude_patterns.join("\n");
-        let settings_clamav_dir = config.clamav_dir.to_string_lossy().to_string();
 
         let mut updater = DatabaseUpdater::default();
         updater.check_database_status(&config);
@@ -57,7 +55,6 @@ impl ClamAvApp {
             settings_max_size,
             settings_threads,
             settings_exclude,
-            settings_clamav_dir,
         }
     }
 
@@ -133,92 +130,130 @@ impl ClamAvApp {
     fn dashboard_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(12.0);
         ui.label(theme::heading("仪表板"));
-        ui.add_space(8.0);
+        ui.add_space(12.0);
 
-        // Status cards row
-        ui.horizontal(|ui| {
+        // Status cards row - enhanced with icons and better styling
+        ui.columns(4, |cols| {
             // ClamAV status card
-            card(ui, 150.0, |ui| {
-                ui.label(
-                    egui::RichText::new("引擎状态")
-                        .font(FontId::proportional(13.0))
-                        .color(theme::TEXT_SECONDARY),
-                );
+            cols[0].vertical_centered(|ui| {
                 let clamscan_exists = self.config.clamscan_path().exists();
-                ui.label(
-                    egui::RichText::new(if clamscan_exists {
-                        "✅ 就绪"
-                    } else {
-                        "❌ 未找到"
-                    })
-                    .font(FontId::proportional(18.0))
-                    .color(if clamscan_exists {
-                        theme::SUCCESS
-                    } else {
-                        theme::DANGER
-                    }),
-                );
+                enhanced_card(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(if clamscan_exists { "⚙️" } else { "❌" })
+                            .font(FontId::proportional(32.0)),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(if clamscan_exists { "就绪" } else { "未找到" })
+                            .font(FontId::proportional(16.0))
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new("引擎状态")
+                            .font(FontId::proportional(11.0)),
+                    );
+                }, if clamscan_exists { theme::SUCCESS } else { theme::DANGER });
             });
 
-            card(ui, 150.0, |ui| {
-                ui.label(
-                    egui::RichText::new("实时保护")
-                        .font(FontId::proportional(13.0))
-                        .color(theme::TEXT_SECONDARY),
-                );
+            // Realtime status
+            cols[1].vertical_centered(|ui| {
                 let rt_on = self.realtime.state == RealtimeState::Running;
-                ui.label(
-                    egui::RichText::new(if rt_on { "🛡 已启用" } else { "⚠ 未启用" })
-                        .font(FontId::proportional(18.0))
-                        .color(if rt_on { theme::SUCCESS } else { theme::WARNING }),
-                );
+                enhanced_card(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(if rt_on { "🛡️" } else { "⚠️" })
+                            .font(FontId::proportional(32.0)),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(if rt_on { "已启用" } else { "未启用" })
+                            .font(FontId::proportional(16.0))
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new("实时保护")
+                            .font(FontId::proportional(11.0)),
+                    );
+                }, if rt_on { theme::SUCCESS } else { theme::WARNING });
             });
 
-            card(ui, 150.0, |ui| {
-                ui.label(
-                    egui::RichText::new("病毒库")
-                        .font(FontId::proportional(13.0))
-                        .color(theme::TEXT_SECONDARY),
-                );
+            // Database status
+            cols[2].vertical_centered(|ui| {
                 let has_db = self.updater.db_version.is_some();
-                ui.label(
-                    egui::RichText::new(if has_db { "✅ 已加载" } else { "⚠ 未配置" })
-                        .font(FontId::proportional(18.0))
-                        .color(if has_db {
-                            theme::SUCCESS
-                        } else {
-                            theme::WARNING
-                        }),
-                );
+                enhanced_card(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(if has_db { "📚" } else { "⚠️" })
+                            .font(FontId::proportional(32.0)),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(if has_db { "已加载" } else { "未配置" })
+                            .font(FontId::proportional(16.0))
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new("病毒库")
+                            .font(FontId::proportional(11.0)),
+                    );
+                }, if has_db { theme::SUCCESS } else { theme::WARNING });
             });
 
-            card(ui, 150.0, |ui| {
-                ui.label(
-                    egui::RichText::new("上次更新")
-                        .font(FontId::proportional(13.0))
-                        .color(theme::TEXT_SECONDARY),
-                );
-                let text = self
-                    .updater
-                    .last_update
-                    .clone()
-                    .unwrap_or_else(|| "从未".into());
-                ui.label(
-                    egui::RichText::new(text)
-                        .font(FontId::proportional(16.0))
-                        .color(theme::TEXT_PRIMARY),
-                );
+            // Threats count
+            cols[3].vertical_centered(|ui| {
+                let threat_count = self.scan_engine.threats.len() + self.realtime.threats.len();
+                enhanced_card(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(if threat_count == 0 { "✅" } else { "⚠️" })
+                            .font(FontId::proportional(32.0)),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(threat_count.to_string())
+                            .font(FontId::proportional(16.0))
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new("发现威胁")
+                            .font(FontId::proportional(11.0)),
+                    );
+                }, if threat_count == 0 { theme::SUCCESS } else { theme::DANGER });
             });
         });
 
-        ui.add_space(16.0);
+        ui.add_space(20.0);
 
-        // Quick actions
+        // Statistics overview
+        ui.label(theme::subheading("统计概览"));
+        ui.add_space(8.0);
+        
+        ui.columns(3, |cols| {
+            cols[0].vertical_centered(|ui| {
+                stat_card(ui, "📊", &self.scan_engine.stats.scanned_files.to_string(), "已扫描文件");
+            });
+            cols[1].vertical_centered(|ui| {
+                stat_card(ui, "🔍", &self.realtime.scanned_count.to_string(), "实时监控扫描");
+            });
+            cols[2].vertical_centered(|ui| {
+                let last_update = self.updater.last_update.clone()
+                    .unwrap_or_else(|| "未更新".to_string());
+                stat_card(ui, "🕒", &last_update, "上次更新");
+            });
+        });
+
+        ui.add_space(20.0);
+
+        // Quick actions - enhanced
         ui.label(theme::subheading("快速操作"));
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
-            if ui.add(theme::accent_button("🔍 快速扫描")).clicked() {
+            if ui.add(theme::accent_button("⚡ 快速扫描")).clicked() {
+                // Quick scan system locations
+                self.start_quick_scan();
+                self.current_tab = Tab::Scan;
+            }
+            if ui.add(theme::accent_button("💿 全盘扫描")).clicked() {
+                // Full disk scan
+                self.start_full_scan();
                 self.current_tab = Tab::Scan;
             }
             if ui.add(theme::accent_button("🔄 更新病毒库")).clicked() {
@@ -228,45 +263,118 @@ impl ClamAvApp {
                 self.current_tab = Tab::Update;
             }
             if self.realtime.state != RealtimeState::Running {
-                if ui.add(theme::accent_button("🛡 启用实时保护")).clicked() {
+                if ui.add(theme::accent_button("🛡 启动保护")).clicked() {
                     self.realtime.start(&self.config);
                     self.current_tab = Tab::Realtime;
                 }
             }
         });
 
-        ui.add_space(16.0);
+        ui.add_space(20.0);
 
-        // Recent threats
+        // Recent threats with better visualization
         ui.label(theme::subheading("最近威胁"));
-        ui.add_space(4.0);
+        ui.add_space(8.0);
 
-        if self.scan_engine.threats.is_empty() {
-            ui.label(
-                egui::RichText::new("  未发现威胁 ✓")
-                    .font(FontId::proportional(14.0))
-                    .color(theme::SUCCESS),
-            );
-        } else {
-            let threats = self.scan_engine.threats.clone();
-            for (i, threat) in threats.iter().enumerate().take(10) {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("  {}. ⚠", i + 1))
-                            .color(theme::DANGER),
-                    );
-                    ui.label(
-                        egui::RichText::new(&threat.threat_name)
-                            .font(FontId::proportional(13.0))
-                            .color(theme::TEXT_PRIMARY),
-                    );
-                    ui.label(
-                        egui::RichText::new(truncate_path(&threat.file_path, 50))
-                            .font(FontId::proportional(12.0))
-                            .color(theme::TEXT_SECONDARY),
-                    );
+        if self.scan_engine.threats.is_empty() && self.realtime.threats.is_empty() {
+            egui::Frame::new()
+                .fill(Color32::from_rgb(30, 60, 50))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(egui::Margin::same(16))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("✅")
+                                .font(FontId::proportional(24.0)),
+                        );
+                        ui.label(
+                            egui::RichText::new("系统安全 - 未发现任何威胁")
+                                .font(FontId::proportional(15.0))
+                                .color(theme::SUCCESS),
+                        );
+                    });
                 });
+        } else {
+            egui::ScrollArea::vertical()
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    // Collect all threats into owned vector
+                    let mut all_threats = Vec::new();
+                    for t in &self.scan_engine.threats {
+                        all_threats.push(crate::scanner::ThreatInfo {
+                            file_path: t.file_path.clone(),
+                            threat_name: t.threat_name.clone(),
+                        });
+                    }
+                    for t in &self.realtime.threats {
+                        all_threats.push(crate::scanner::ThreatInfo {
+                            file_path: t.file_path.clone(),
+                            threat_name: t.threat_name.clone(),
+                        });
+                    }
+                    
+                    for threat in all_threats.iter().take(20) {
+                        egui::Frame::new()
+                            .fill(Color32::from_rgb(60, 30, 30))
+                            .corner_radius(CornerRadius::same(6))
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("⚠️")
+                                            .font(FontId::proportional(18.0)),
+                                    );
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(&threat.threat_name)
+                                                .font(FontId::proportional(13.0))
+                                                .color(theme::WARNING)
+                                                .strong(),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(truncate_path(&threat.file_path, 60))
+                                                .font(FontId::proportional(11.0)),
+                                        );
+                                    });
+                                });
+                            });
+                        ui.add_space(4.0);
+                    }
+                });
+        }
+    }
+
+    fn start_quick_scan(&mut self) {
+        // Scan critical system locations
+        let mut paths = Vec::new();
+        
+        if let Some(home) = dirs::home_dir() {
+            paths.push(home.join("Downloads"));
+            paths.push(home.join("Desktop"));
+            paths.push(home.join("Documents"));
+        }
+        
+        // Temp directories
+        if let Ok(temp) = std::env::var("TEMP") {
+            paths.push(std::path::PathBuf::from(temp));
+        }
+        
+        // Use first valid path
+        for path in paths {
+            if path.exists() {
+                self.scan_target = path.to_string_lossy().to_string();
+                self.scan_engine.start_scan(path, &self.config);
+                break;
             }
+        }
+    }
+
+    fn start_full_scan(&mut self) {
+        // Scan C: drive
+        let c_drive = std::path::PathBuf::from("C:\\");
+        if c_drive.exists() {
+            self.scan_target = "C:\\ (完整扫描)".to_string();
+            self.scan_engine.start_scan(c_drive, &self.config);
         }
     }
 
@@ -304,6 +412,12 @@ impl ClamAvApp {
                 if let Some(file) = rfd::FileDialog::new().pick_file() {
                     self.scan_target = file.to_string_lossy().to_string();
                 }
+            }
+            if ui.add(theme::accent_button("⚡ 快速扫描")).clicked() {
+                self.start_quick_scan();
+            }
+            if ui.add(theme::accent_button("💿 全盘扫描")).clicked() {
+                self.start_full_scan();
             }
 
             match self.scan_engine.state {
@@ -380,18 +494,31 @@ impl ClamAvApp {
 
         ui.add_space(12.0);
 
-        // Current file being scanned
+        // Current file being scanned - enhanced display
         if self.scan_engine.state == ScanState::Scanning {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true), |ui| {
-                    ui.label(
-                        egui::RichText::new(&self.scan_engine.current_file)
-                            .font(FontId::proportional(12.0))
-                            .color(theme::TEXT_SECONDARY),
-                    );
+            ui.add_space(4.0);
+            egui::Frame::new()
+                .fill(Color32::from_rgb(40, 40, 50))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.add_space(8.0);
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new("正在扫描")
+                                    .font(FontId::proportional(11.0))
+                                    .color(theme::TEXT_SECONDARY),
+                            );
+                            ui.label(
+                                egui::RichText::new(&self.scan_engine.current_file)
+                                    .font(FontId::proportional(10.0))
+                                    .color(Color32::from_rgb(150, 150, 150)),
+                            );
+                        });
+                    });
                 });
-            });
             ui.add_space(8.0);
         }
 
@@ -846,21 +973,20 @@ impl ClamAvApp {
         ui.add_space(12.0);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            // ClamAV directory
-            ui.label(theme::subheading("ClamAV 路径"));
+            // Theme toggle
+            ui.label(theme::subheading("界面主题"));
+            ui.add_space(4.0);
+            let mut theme_changed = false;
             ui.horizontal(|ui| {
-                ui.add_sized(
-                    [400.0, 26.0],
-                    egui::TextEdit::singleline(&mut self.settings_clamav_dir)
-                        .font(FontId::proportional(13.0)),
-                );
-                if ui.add(theme::accent_button("📁 浏览")).clicked() {
-                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                        self.settings_clamav_dir = folder.to_string_lossy().to_string();
-                    }
+                ui.label("🌙");
+                if ui.checkbox(&mut self.config.dark_mode, "深色模式").changed() {
+                    theme_changed = true;
                 }
             });
-            ui.add_space(8.0);
+            if theme_changed {
+                theme::apply_theme(ui.ctx(), self.config.dark_mode);
+            }
+            ui.add_space(12.0);
 
             // Scan options
             ui.label(theme::subheading("扫描选项"));
@@ -911,9 +1037,6 @@ impl ClamAvApp {
             ui.add_space(16.0);
 
             if ui.add(theme::accent_button("💾 保存设置")).clicked() {
-                self.config.clamav_dir =
-                    std::path::PathBuf::from(&self.settings_clamav_dir);
-                self.config.database_dir = self.config.clamav_dir.join("database");
                 if let Ok(v) = self.settings_max_size.parse::<u64>() {
                     self.config.max_file_size_mb = v;
                 }
@@ -984,7 +1107,7 @@ impl Drop for ClamAvApp {
 impl eframe::App for ClamAvApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.theme_applied {
-            theme::apply_theme(ctx);
+            theme::apply_theme(ctx, self.config.dark_mode);
             self.theme_applied = true;
         }
 
@@ -1041,6 +1164,45 @@ fn card(ui: &mut egui::Ui, width: f32, add_contents: impl FnOnce(&mut egui::Ui))
         .show(ui, |ui| {
             ui.set_min_width(width);
             add_contents(ui);
+        });
+}
+
+fn enhanced_card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui), accent_color: Color32) {
+    egui::Frame::new()
+        .fill(theme::BG_CARD)
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(egui::Margin::same(16))
+        .stroke(Stroke::new(2.0, accent_color.gamma_multiply(0.3)))
+        .show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                add_contents(ui);
+            });
+        });
+}
+
+fn stat_card(ui: &mut egui::Ui, icon: &str, value: &str, label: &str) {
+    egui::Frame::new()
+        .fill(theme::BG_CARD)
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(12))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(55, 55, 55)))
+        .show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new(icon)
+                        .font(FontId::proportional(20.0)),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(value)
+                        .font(FontId::proportional(18.0))
+                        .strong(),
+                );
+                ui.label(
+                    egui::RichText::new(label)
+                        .font(FontId::proportional(10.0)),
+                );
+            });
         });
 }
 

@@ -20,6 +20,12 @@ pub struct AppConfig {
     pub auto_update: bool,
     #[serde(default)]
     pub persist_realtime_on_exit: bool,
+    #[serde(default = "default_dark_mode")]
+    pub dark_mode: bool,
+}
+
+fn default_dark_mode() -> bool {
+    true
 }
 
 impl Default for AppConfig {
@@ -31,7 +37,7 @@ impl Default for AppConfig {
             quarantine_dir: base.join("quarantine"),
             log_dir: base.join("logs"),
             max_file_size_mb: 100,
-            max_scan_threads: 2,
+            max_scan_threads: 4,
             scan_archives: true,
             scan_mail: true,
             scan_ole2: true,
@@ -42,6 +48,7 @@ impl Default for AppConfig {
             exclude_patterns: vec![],
             auto_update: true,
             persist_realtime_on_exit: false,
+            dark_mode: true,
         }
     }
 }

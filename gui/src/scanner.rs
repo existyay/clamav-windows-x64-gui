@@ -190,6 +190,13 @@ fn run_clamscan(
 
     cmd.arg(format!("--max-filesize={}M", max_size_mb));
     cmd.arg(format!("--max-scansize={}M", max_size_mb * 4));
+    
+    // Performance optimization: use multiple threads
+    cmd.arg("--max-threads=4");
+    
+    // Speed up scanning
+    cmd.arg("--max-rechwait=10");
+    cmd.arg("--max-files=10000");
 
     if !scan_archives {
         cmd.arg("--no-archive");
