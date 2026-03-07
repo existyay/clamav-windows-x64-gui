@@ -71,7 +71,7 @@ impl ClamAvApp {
                         .color(theme::ACCENT),
                 );
                 ui.label(
-                    egui::RichText::new("Antivirus Scanner")
+                    egui::RichText::new("杀毒软件扫描器")
                         .font(FontId::proportional(12.0))
                         .color(theme::text_secondary(dark_mode)),
                 );
@@ -120,7 +120,7 @@ impl ClamAvApp {
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                 ui.add_space(12.0);
                 ui.label(
-                    egui::RichText::new("v1.0.5")
+                    egui::RichText::new("v1.0.6")
                         .font(FontId::proportional(11.0))
                         .color(theme::text_secondary(dark_mode)),
                 );
