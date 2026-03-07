@@ -1,5 +1,6 @@
 use crate::config::AppConfig;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -360,6 +361,203 @@ fn run_scanner(
     scan_child_id: Arc<Mutex<Option<u32>>>,
     tx: mpsc::Sender<ScanMessage>,
 ) {
+    if use_daemon {
+        // 直接通过 TCP 连接 clamd 守护进程（绕过 clamdscan 的 OK 输出过滤问题）
+        run_scanner_via_socket(targets, recursive, cancel, tx);
+    } else {
+        // 独立模式：使用 clamscan 进程
+        run_scanner_via_process(
+            scanner_path, targets, db_dir, recursive, max_size_mb,
+            scan_archives, excludes, cancel, scan_child_id, tx,
+        );
+    }
+}
+
+/// 通过 TCP 套接字直接与 clamd 守护进程通信扫描
+/// clamd 对每个文件返回 "filepath: OK\0" 或 "filepath: VirusName FOUND\0"
+/// 这解决了 clamdscan 吞掉 OK 输出导致无法统计的问题
+fn run_scanner_via_socket(
+    targets: Vec<PathBuf>,
+    recursive: bool,
+    cancel: Arc<Mutex<bool>>,
+    tx: mpsc::Sender<ScanMessage>,
+) {
+    let start = std::time::Instant::now();
+    let mut scanned: u64 = 0;
+    let mut infected: u64 = 0;
+    let mut last_stats_update = std::time::Instant::now();
+
+    for target in &targets {
+        let is_cancelled = cancel.lock().map(|f| *f).unwrap_or(false);
+        if is_cancelled {
+            break;
+        }
+
+        let mut stream = match TcpStream::connect("127.0.0.1:3310") {
+            Ok(s) => {
+                // Set read timeout so cancel flag can be checked periodically
+                let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                s
+            }
+            Err(e) => {
+                let _ = tx.send(ScanMessage::Error(format!(
+                    "无法连接 clamd 守护进程 (127.0.0.1:3310): {}", e
+                )));
+                return;
+            }
+        };
+
+        // 发送扫描命令（z 前缀 = null-terminated 协议）
+        // CONTSCAN: 递归扫描，遇到病毒继续扫描
+        // MULTISCAN: 递归多线程扫描
+        let cmd_name = if recursive { "MULTISCAN" } else { "CONTSCAN" };
+        let target_str = target.to_string_lossy();
+        let cmd = format!("z{} {}", cmd_name, target_str);
+
+        if let Err(e) = stream.write_all(cmd.as_bytes()) {
+            let _ = tx.send(ScanMessage::Error(format!("发送扫描命令失败: {}", e)));
+            return;
+        }
+        // Write null terminator
+        if let Err(e) = stream.write_all(&[0u8]) {
+            let _ = tx.send(ScanMessage::Error(format!("发送扫描命令失败: {}", e)));
+            return;
+        }
+
+        // 读取 clamd 响应（null-terminated 行）
+        let mut buf = Vec::with_capacity(4096);
+        let mut byte = [0u8; 1];
+        loop {
+            let is_cancelled = cancel.lock().map(|f| *f).unwrap_or(false);
+            if is_cancelled {
+                break;
+            }
+
+            match stream.read(&mut byte) {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    if byte[0] == 0 {
+                        // Null terminator = end of one response line
+                        let line = String::from_utf8_lossy(&buf).to_string();
+                        buf.clear();
+
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+
+                        if line.contains("FOUND") {
+                            infected += 1;
+                            scanned += 1;
+                            // Format: "filepath: VirusName FOUND"
+                            if let Some(colon_pos) = line.rfind(": ") {
+                                let file_path = line[..colon_pos].trim().to_string();
+                                let rest = line[colon_pos + 2..].trim();
+                                let threat_name = rest.trim_end_matches("FOUND").trim().to_string();
+                                let _ = tx.send(ScanMessage::ThreatFound(ThreatInfo {
+                                    file_path: file_path.clone(),
+                                    threat_name,
+                                }));
+                                let _ = tx.send(ScanMessage::Progress(file_path));
+                            }
+                        } else if line.contains(": OK") {
+                            scanned += 1;
+                            if let Some(path) = line.split(": OK").next() {
+                                let path = path.trim();
+                                if !path.is_empty() {
+                                    let _ = tx.send(ScanMessage::Progress(path.to_string()));
+                                }
+                            }
+                        } else if line.contains("ERROR") {
+                            // clamd error for a specific file, log but continue
+                            let _ = tx.send(ScanMessage::Progress(line.clone()));
+                        }
+
+                        // Throttled stats update
+                        if last_stats_update.elapsed().as_secs_f64() > 1.0 {
+                            let _ = tx.send(ScanMessage::Stats(ScanStats {
+                                scanned_files: scanned,
+                                infected_files: infected,
+                                scanned_data_mb: 0.0,
+                                elapsed_secs: start.elapsed().as_secs_f64(),
+                            }));
+                            last_stats_update = std::time::Instant::now();
+                        }
+                    } else {
+                        buf.push(byte[0]);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    // Read timeout - just loop back to check cancel flag
+                    continue;
+                }
+                Err(e) => {
+                    let _ = tx.send(ScanMessage::Error(format!("读取 clamd 响应失败: {}", e)));
+                    break;
+                }
+            }
+        }
+        // Process remaining data in buffer (if clamd doesn't null-terminate last line)
+        if !buf.is_empty() {
+            let line = String::from_utf8_lossy(&buf).to_string();
+            if line.contains("FOUND") {
+                infected += 1;
+                scanned += 1;
+                if let Some(colon_pos) = line.rfind(": ") {
+                    let file_path = line[..colon_pos].trim().to_string();
+                    let rest = line[colon_pos + 2..].trim();
+                    let threat_name = rest.trim_end_matches("FOUND").trim().to_string();
+                    let _ = tx.send(ScanMessage::ThreatFound(ThreatInfo {
+                        file_path: file_path.clone(),
+                        threat_name,
+                    }));
+                }
+            } else if line.contains(": OK") {
+                scanned += 1;
+            }
+        }
+    }
+
+    let was_cancelled = cancel.lock().map(|f| *f).unwrap_or(false);
+    if was_cancelled {
+        let _ = tx.send(ScanMessage::Finished(ScanStats {
+            scanned_files: scanned,
+            infected_files: infected,
+            scanned_data_mb: 0.0,
+            elapsed_secs: start.elapsed().as_secs_f64(),
+        }));
+        return;
+    }
+
+    let _ = tx.send(ScanMessage::Stats(ScanStats {
+        scanned_files: scanned,
+        infected_files: infected,
+        scanned_data_mb: 0.0,
+        elapsed_secs: start.elapsed().as_secs_f64(),
+    }));
+
+    let _ = tx.send(ScanMessage::Finished(ScanStats {
+        scanned_files: scanned,
+        infected_files: infected,
+        scanned_data_mb: 0.0,
+        elapsed_secs: start.elapsed().as_secs_f64(),
+    }));
+}
+
+/// 通过 clamscan 子进程执行扫描（独立模式）
+fn run_scanner_via_process(
+    scanner_path: PathBuf,
+    targets: Vec<PathBuf>,
+    db_dir: PathBuf,
+    recursive: bool,
+    max_size_mb: u64,
+    scan_archives: bool,
+    excludes: Vec<String>,
+    cancel: Arc<Mutex<bool>>,
+    scan_child_id: Arc<Mutex<Option<u32>>>,
+    tx: mpsc::Sender<ScanMessage>,
+) {
     if !scanner_path.exists() {
         let _ = tx.send(ScanMessage::Error(format!(
             "扫描器未找到: {}",
@@ -369,37 +567,26 @@ fn run_scanner(
     }
 
     let mut cmd = Command::new(&scanner_path);
-    
-    if use_daemon {
-        // clamdscan 参数（通过 clamd 守护进程扫描）
-        cmd.arg("--verbose");
-        cmd.arg("--stdout");
-        
-        if recursive {
-            cmd.arg("--multiscan");  // 多线程扫描
-        }
-    } else {
-        // clamscan 参数（独立扫描）
-        cmd.arg("--verbose");
-        cmd.arg("--stdout");
 
-        if db_dir.exists() {
-            cmd.arg(format!("--database={}", db_dir.display()));
-        }
+    cmd.arg("--verbose");
+    cmd.arg("--stdout");
 
-        if recursive {
-            cmd.arg("--recursive");
-        }
+    if db_dir.exists() {
+        cmd.arg(format!("--database={}", db_dir.display()));
+    }
 
-        cmd.arg(format!("--max-filesize={}M", max_size_mb));
-        cmd.arg(format!("--max-scansize={}M", max_size_mb * 4));
-        cmd.arg("--max-dir-recursion=15");
-        cmd.arg("--pcre-match-limit=10000");
-        cmd.arg("--pcre-recmatch-limit=5000");
+    if recursive {
+        cmd.arg("--recursive");
+    }
 
-        if !scan_archives {
-            cmd.arg("--no-archive");
-        }
+    cmd.arg(format!("--max-filesize={}M", max_size_mb));
+    cmd.arg(format!("--max-scansize={}M", max_size_mb * 4));
+    cmd.arg("--max-dir-recursion=15");
+    cmd.arg("--pcre-match-limit=10000");
+    cmd.arg("--pcre-recmatch-limit=5000");
+
+    if !scan_archives {
+        cmd.arg("--no-archive");
     }
 
     for pat in &excludes {
@@ -411,7 +598,7 @@ fn run_scanner(
     for target in &targets {
         cmd.arg(target.to_string_lossy().as_ref());
     }
-    
+
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -471,7 +658,6 @@ fn run_scanner(
     let mut last_stats_update = std::time::Instant::now();
 
     for line in reader.lines() {
-        // Check cancel flag (secondary check - primary kill is via cancel_scan)
         let is_cancelled = cancel.lock().map(|f| *f).unwrap_or(false);
         if is_cancelled {
             break;
@@ -483,7 +669,6 @@ fn run_scanner(
         };
 
         if line.contains("FOUND") {
-            // Infected file found (works for both clamscan and clamdscan)
             infected += 1;
             scanned += 1;
             let parts: Vec<&str> = line.splitn(2, ':').collect();
@@ -497,18 +682,13 @@ fn run_scanner(
                 let _ = tx.send(ScanMessage::Progress(file_path));
             }
         } else if line.contains(": OK") {
-            // Clean file (works for both clamscan and clamdscan)
             scanned += 1;
-
-            // Extract file path for progress display (critical for clamdscan mode)
             if let Some(path) = line.split(": OK").next() {
                 let path = path.trim();
                 if !path.is_empty() {
                     let _ = tx.send(ScanMessage::Progress(path.to_string()));
                 }
             }
-
-            // Throttled stats update (once per second)
             if last_stats_update.elapsed().as_secs_f64() > 1.0 {
                 let _ = tx.send(ScanMessage::Stats(ScanStats {
                     scanned_files: scanned,
@@ -519,7 +699,6 @@ fn run_scanner(
                 last_stats_update = std::time::Instant::now();
             }
         } else if line.starts_with("Scanning") {
-            // clamscan verbose mode: "Scanning /path/file"
             let file = line.replace("Scanning", "").trim().to_string();
             if !file.is_empty() {
                 let _ = tx.send(ScanMessage::Progress(file));
@@ -539,15 +718,13 @@ fn run_scanner(
         }
     }
 
-    // Clear PID - process is about to exit
+    // Clear PID
     if let Ok(mut pid) = scan_child_id.lock() {
         *pid = None;
     }
 
-    // Check if cancelled
     let was_cancelled = cancel.lock().map(|f| *f).unwrap_or(false);
     if was_cancelled {
-        // Process was killed externally, just reap and send final stats
         let _ = child.wait();
         let _ = stderr_handle.join();
         let _ = tx.send(ScanMessage::Finished(ScanStats {
@@ -562,7 +739,6 @@ fn run_scanner(
     let status = child.wait();
     let stderr_text = stderr_handle.join().unwrap_or_default();
 
-    // Send final stats (use counted values as authoritative)
     let _ = tx.send(ScanMessage::Stats(ScanStats {
         scanned_files: scanned,
         infected_files: infected,
@@ -572,7 +748,6 @@ fn run_scanner(
 
     if let Ok(exit_status) = status {
         let code = exit_status.code().unwrap_or(-1);
-        // Exit code 0 = clean, 1 = virus found (not an error!), 2+ = error
         if code >= 2 {
             let details = if stderr_text.is_empty() {
                 format!("扫描器退出代码: {}", code)
