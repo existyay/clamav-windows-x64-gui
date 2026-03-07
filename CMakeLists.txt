@@ -368,7 +368,6 @@ if (WIN32)
 
     install(
         FILES
-            ${CMAKE_CURRENT_SOURCE_DIR}/NEWS.md
             ${CMAKE_CURRENT_SOURCE_DIR}/README.md
         DESTINATION ".")
 

@@ -138,6 +138,9 @@ jobs:
           if (Test-Path "$clamavInstall\COPYING.txt") {
             Copy-Item "$clamavInstall\COPYING.txt" "$outputDir\LICENSE.txt"
           }
+          if (Test-Path "$clamavInstall\COPYING") {
+            Copy-Item "$clamavInstall\COPYING" "$outputDir\COPYING" -Recurse
+          }
 
           # Create ZIP
           Compress-Archive -Path "$outputDir\*" -DestinationPath "dist\ClamAV-GUI-Portable-x64.zip" -CompressionLevel Optimal
