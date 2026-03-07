@@ -1,0 +1,43 @@
+name: GUI Quick CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'gui/**'
+      - '.github/workflows/ci-gui.yml'
+      - '.github/workflows/build-gui.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'gui/**'
+      - '.github/workflows/ci-gui.yml'
+      - '.github/workflows/build-gui.yml'
+
+concurrency:
+  group: ci-gui-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quick-check:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            gui -> target
+
+      - name: Cargo check (debug)
+        run: |
+          cd gui
+          cargo check
+        shell: pwsh

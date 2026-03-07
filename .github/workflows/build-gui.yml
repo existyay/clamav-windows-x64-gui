@@ -1,25 +1,12 @@
 name: Build ClamAV GUI
 
+concurrency:
+  group: build-gui-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'gui/**'
-      - '.github/workflows/build-gui.yml'
-      - 'vcpkg.json'
-      - 'CMakeLists.txt'
   workflow_dispatch:
     inputs:
-      version_type:
-        description: 'Version bump type'
-        required: false
-        default: 'patch'
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
       create_release:
         description: 'Create GitHub Release'
         required: false
@@ -53,16 +40,8 @@ jobs:
             $patch = 0
           }
 
-          # Determine version bump
-          $versionType = "${{ github.event.inputs.version_type }}"
-          if ([string]::IsNullOrEmpty($versionType)) { $versionType = "patch" }
-
-          # Bump version
-          switch ($versionType) {
-            "major" { $major++; $minor = 0; $patch = 0 }
-            "minor" { $minor++; $patch = 0 }
-            default { $patch++ }
-          }
+          # Fixed bump strategy: always patch
+          $patch++
 
           $newVersion = "$major.$minor.$patch"
           $tagName = "v$newVersion"
@@ -115,22 +94,27 @@ jobs:
           key: vcpkg-x64-windows-${{ hashFiles('vcpkg.json') }}
           restore-keys: vcpkg-x64-windows-
 
+      - name: Cache ClamAV install
+        id: clamav_install_cache
+        uses: actions/cache@v4
+        with:
+          path: build/install
+          key: clamav-install-x64-${{ hashFiles('CMakeLists.txt', 'CMakeOptions.cmake', 'vcpkg.json', 'cmake/**', 'clamd/**', 'clamscan/**', 'freshclam/**', 'libclamav/**', 'libfreshclam/**') }}
+          restore-keys: clamav-install-x64-
+
       - name: Install vcpkg dependencies
         run: |
           & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows
         shell: pwsh
 
       - name: Cache Rust build
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            gui\target
-            ~\.cargo\registry
-            ~\.cargo\git
-          key: rust-release-${{ hashFiles('gui/Cargo.lock') }}
-          restore-keys: rust-release-
+          workspaces: |
+            gui -> target
 
       - name: Configure ClamAV (CMake)
+        if: steps.clamav_install_cache.outputs.cache-hit != 'true'
         run: |
           mkdir build -ErrorAction SilentlyContinue
           cd build
@@ -144,10 +128,16 @@ jobs:
             -D ENABLE_DOXYGEN=OFF
 
       - name: Build ClamAV
+        if: steps.clamav_install_cache.outputs.cache-hit != 'true'
         run: |
           cd build
-          cmake --build . --config Release
-          cmake --build . --config Release --target install
+          cmake --build . --config Release --parallel
+          cmake --build . --config Release --target install --parallel
+
+      - name: Reuse cached ClamAV binaries
+        if: steps.clamav_install_cache.outputs.cache-hit == 'true'
+        run: |
+          Write-Host "Using cached build/install (skipping CMake configure+build)."
 
       - name: Prepare Chinese font
         run: |
@@ -178,6 +168,8 @@ jobs:
           $buildTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
           $commitHash = git rev-parse --short HEAD
 
+          New-Item -ItemType Directory -Path "dist" -Force | Out-Null
+
           @"
           Version: $version
           Build Time: $buildTime
@@ -191,6 +183,12 @@ jobs:
         run: |
           $outputDir = "dist\ClamAV-GUI-Portable"
           $clamavInstall = "build\install"
+          $guiExe = "gui\target\release\clamav-gui.exe"
+
+          if (-not (Test-Path $guiExe)) {
+            Write-Error "Missing GUI executable: $guiExe. Ensure 'Build GUI' step completed successfully."
+            exit 1
+          }
 
           # Create directories
           New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
@@ -201,7 +199,7 @@ jobs:
           New-Item -ItemType Directory -Path "$outputDir\logs" -Force | Out-Null
 
           # Copy GUI
-          Copy-Item "gui\target\release\clamav-gui.exe" "$outputDir\ClamAV-Scanner.exe"
+          Copy-Item $guiExe "$outputDir\ClamAV-Scanner.exe"
 
           # Copy ClamAV executables
           $exes = @("clamscan.exe","freshclam.exe","clamd.exe","clamdscan.exe")
@@ -258,7 +256,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add gui/Cargo.toml gui/Cargo.lock
+          git add gui/Cargo.toml
+          if (Test-Path "gui/Cargo.lock") {
+            git add gui/Cargo.lock
+          }
           git diff --staged --quiet || git commit -m "chore: bump version to ${{ steps.version.outputs.version }} [skip ci]"
           git push origin HEAD:${{ github.ref_name }}
         shell: pwsh
