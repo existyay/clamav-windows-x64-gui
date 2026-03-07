@@ -69,25 +69,37 @@ pub fn apply_theme(ctx: &egui::Context, dark_mode: bool) {
     style.visuals = visuals;
     ctx.set_style(style);
 
-    // Try to load Chinese font with fallback chain
-    let font_data = load_chinese_font();
+    // Load Chinese + Emoji fonts with fallback chain
+    let chinese_font = load_chinese_font();
+    let emoji_font = load_emoji_font();
     
-    if let Some(data) = font_data {
+    if chinese_font.is_some() || emoji_font.is_some() {
         let mut fonts = egui::FontDefinitions::default();
-        fonts.font_data.insert(
-            "chinese".to_owned(),
-            std::sync::Arc::new(egui::FontData::from_owned(data)),
-        );
-        fonts
-            .families
-            .entry(FontFamily::Proportional)
-            .or_default()
-            .insert(0, "chinese".to_owned());
-        fonts
-            .families
-            .entry(FontFamily::Monospace)
-            .or_default()
-            .push("chinese".to_owned());
+        
+        // Load Chinese font
+        if let Some(data) = chinese_font {
+            fonts.font_data.insert(
+                "chinese".to_owned(),
+                std::sync::Arc::new(egui::FontData::from_owned(data)),
+            );
+            
+            // Set Chinese font as first priority
+            fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "chinese".to_owned());
+            fonts.families.entry(FontFamily::Monospace).or_default().push("chinese".to_owned());
+        }
+        
+        // Load Emoji font
+        if let Some(data) = emoji_font {
+            fonts.font_data.insert(
+                "emoji".to_owned(),
+                std::sync::Arc::new(egui::FontData::from_owned(data)),
+            );
+            
+            // Add Emoji font as fallback
+            fonts.families.entry(FontFamily::Proportional).or_default().push("emoji".to_owned());
+            fonts.families.entry(FontFamily::Monospace).or_default().push("emoji".to_owned());
+        }
+        
         ctx.set_fonts(fonts);
     }
 }
@@ -132,6 +144,46 @@ fn load_chinese_font() -> Option<Vec<u8>> {
         ];
 
         for font_path in &system_fonts {
+            if let Ok(data) = std::fs::read(font_path) {
+                return Some(data);
+            }
+        }
+    }
+
+    None
+}
+
+/// Load Emoji font for proper emoji display
+fn load_emoji_font() -> Option<Vec<u8>> {
+    #[cfg(target_os = "windows")]
+    {
+        let emoji_fonts = [
+            "C:\\Windows\\Fonts\\seguiemj.ttf",  // Segoe UI Emoji
+            "C:\\Windows\\Fonts\\seguisym.ttf",  // Segoe UI Symbol
+        ];
+
+        for font_path in &emoji_fonts {
+            if let Ok(data) = std::fs::read(font_path) {
+                return Some(data);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(data) = std::fs::read("/System/Library/Fonts/Apple Color Emoji.ttc") {
+            return Some(data);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let emoji_fonts = [
+            "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+            "/usr/share/fonts/truetype/ancient-scripts/Symbola.ttf",
+        ];
+
+        for font_path in &emoji_fonts {
             if let Ok(data) = std::fs::read(font_path) {
                 return Some(data);
             }
