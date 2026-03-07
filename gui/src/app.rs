@@ -44,9 +44,15 @@ impl ClamAvApp {
         let mut updater = DatabaseUpdater::default();
         updater.check_database_status(&config);
 
+        // 自动启动 clamd 守护进程（提升性能）
+        let mut scan_engine = ScanEngine::default();
+        if config.clamd_path().exists() {
+            let _ = scan_engine.clamd_daemon.start(&config);
+        }
+
         Self {
             config,
-            scan_engine: ScanEngine::default(),
+            scan_engine,
             updater,
             realtime: RealtimeProtection::default(),
             current_tab: Tab::Dashboard,
@@ -136,22 +142,25 @@ impl ClamAvApp {
 
         // Status cards row - enhanced with icons and better styling
         ui.columns(4, |cols| {
-            // ClamAV status card
+            // ClamAV 引擎状态 - 显示是否使用守护进程高性能模式
             cols[0].vertical_centered(|ui| {
+                let daemon_running = self.scan_engine.clamd_daemon.is_running;
                 let clamscan_exists = self.config.clamscan_path().exists();
+                let status_ok = daemon_running || clamscan_exists;
+                
                 enhanced_card(ui, |ui| {
-                    status_icon(ui, if clamscan_exists { "⚙" } else { "✖" });
+                    status_icon(ui, if daemon_running { "⚡" } else if clamscan_exists { "⚙" } else { "✖" });
                     ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new(if clamscan_exists { "就绪" } else { "未找到" })
+                        egui::RichText::new(if daemon_running { "高性能" } else if clamscan_exists { "标准" } else { "未找到" })
                             .font(FontId::proportional(16.0))
                             .strong(),
                     );
                     ui.label(
-                        egui::RichText::new("引擎状态")
+                        egui::RichText::new(if daemon_running { "守护进程模式" } else { "引擎状态" })
                             .font(FontId::proportional(11.0)),
                     );
-                }, if clamscan_exists { theme::SUCCESS } else { theme::DANGER });
+                }, if daemon_running { theme::SUCCESS } else if status_ok { theme::WARNING } else { theme::DANGER });
             });
 
             // Realtime status
@@ -236,12 +245,13 @@ impl ClamAvApp {
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
-            if ui.add(theme::accent_button("⚡ 快速扫描")).clicked() {
+            let scan_busy = self.scan_engine.state == ScanState::Scanning;
+            if ui.add_enabled(!scan_busy, theme::accent_button("⚡ 快速扫描")).clicked() {
                 // Quick scan system locations
                 self.start_quick_scan();
                 self.current_tab = Tab::Scan;
             }
-            if ui.add(theme::accent_button("💿 全盘扫描")).clicked() {
+            if ui.add_enabled(!scan_busy, theme::accent_button("💿 全盘扫描")).clicked() {
                 // Full disk scan
                 self.start_full_scan();
                 self.current_tab = Tab::Scan;
@@ -434,20 +444,21 @@ impl ClamAvApp {
 
         // Buttons row
         ui.horizontal_wrapped(|ui| {
-            if ui.add(theme::accent_button("📁 浏览文件夹")).clicked() {
+            let scan_busy = self.scan_engine.state == ScanState::Scanning;
+            if ui.add_enabled(!scan_busy, theme::accent_button("📁 浏览文件夹")).clicked() {
                 if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                     self.scan_target = folder.to_string_lossy().to_string();
                 }
             }
-            if ui.add(theme::accent_button("📄 浏览文件")).clicked() {
+            if ui.add_enabled(!scan_busy, theme::accent_button("📄 浏览文件")).clicked() {
                 if let Some(file) = rfd::FileDialog::new().pick_file() {
                     self.scan_target = file.to_string_lossy().to_string();
                 }
             }
-            if ui.add(theme::accent_button("⚡ 快速扫描")).clicked() {
+            if ui.add_enabled(!scan_busy, theme::accent_button("⚡ 快速扫描")).clicked() {
                 self.start_quick_scan();
             }
-            if ui.add(theme::accent_button("💿 全盘扫描")).clicked() {
+            if ui.add_enabled(!scan_busy, theme::accent_button("💿 全盘扫描")).clicked() {
                 self.start_full_scan();
             }
 
@@ -1035,9 +1046,80 @@ impl ClamAvApp {
             }
             ui.add_space(12.0);
 
+            // 性能设置
+            ui.label(theme::subheading("性能设置"));
+            ui.add_space(4.0);
+            
+            let daemon_running = self.scan_engine.clamd_daemon.is_running;
+            let daemon_available = self.config.clamd_path().exists();
+            
+            if daemon_available {
+                ui.horizontal(|ui| {
+                    ui.label(if daemon_running { "⚡" } else { "⚙" });
+                    ui.label(
+                        egui::RichText::new(if daemon_running {
+                            "ClamAV 守护进程已启动（高性能模式）"
+                        } else {
+                            "ClamAV 守护进程未启动（标准模式）"
+                        })
+                        .color(if daemon_running { theme::SUCCESS } else { theme::text_secondary(ui.visuals().dark_mode) }),
+                    );
+                });
+                
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if daemon_running {
+                        if ui.add(theme::danger_button("⏹ 停止守护进程")).clicked() {
+                            self.scan_engine.clamd_daemon.stop();
+                        }
+                    } else {
+                        if ui.add(theme::accent_button("▶ 启动守护进程")).clicked() {
+                            let _ = self.scan_engine.clamd_daemon.start(&self.config);
+                        }
+                    }
+                });
+                
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("💡 守护进程模式：病毒库常驻内存，扫描速度提升 10-50 倍")
+                        .font(FontId::proportional(11.0))
+                        .color(theme::text_secondary(ui.visuals().dark_mode)),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new("⚠ clamd.exe 未找到，无法使用高性能模式")
+                        .color(theme::WARNING),
+                );
+            }
+            
+            ui.add_space(12.0);
+
             // Scan options
             ui.label(theme::subheading("扫描选项"));
             ui.add_space(4.0);
+
+            // 扫描预设
+            ui.label(
+                egui::RichText::new("扫描预设")
+                    .font(FontId::proportional(12.0))
+                    .color(theme::text_secondary(ui.visuals().dark_mode)),
+            );
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                if ui.add(theme::accent_button("⚡ 快速模式")).on_hover_text("跳过压缩包和邮件，速度最快").clicked() {
+                    self.config.apply_fast_scan_preset();
+                    self.settings_max_size = self.config.max_file_size_mb.to_string();
+                }
+                if ui.add(theme::accent_button("⚖ 平衡模式")).on_hover_text("推荐设置，性能与安全平衡").clicked() {
+                    self.config.apply_balanced_scan_preset();
+                    self.settings_max_size = self.config.max_file_size_mb.to_string();
+                }
+                if ui.add(theme::accent_button("🔬 深度模式")).on_hover_text("全面扫描，最安全但较慢").clicked() {
+                    self.config.apply_thorough_scan_preset();
+                    self.settings_max_size = self.config.max_file_size_mb.to_string();
+                }
+            });
+            ui.add_space(8.0);
 
             ui.checkbox(&mut self.config.recursive_scan, "递归扫描子目录");
             ui.checkbox(&mut self.config.scan_archives, "扫描压缩包文件");
@@ -1163,6 +1245,9 @@ impl eframe::App for ClamAvApp {
         self.scan_engine.poll_messages();
         self.updater.poll_messages();
         self.realtime.poll_messages();
+
+        // 检查 clamd 守护进程状态
+        self.scan_engine.clamd_daemon.check_status();
 
         // Request repaint while scanning/updating/realtime
         if self.scan_engine.state == ScanState::Scanning
