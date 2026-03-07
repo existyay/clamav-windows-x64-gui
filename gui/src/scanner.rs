@@ -87,7 +87,6 @@ impl ScanEngine {
         let db_dir = config.database_dir.clone();
         let recursive = config.recursive_scan;
         let max_size = config.max_file_size_mb;
-        let max_threads = config.max_scan_threads;
         let scan_archives = config.scan_archives;
         let excludes = config.exclude_patterns.clone();
 
@@ -98,7 +97,6 @@ impl ScanEngine {
                 db_dir,
                 recursive,
                 max_size,
-                max_threads,
                 scan_archives,
                 excludes,
                 cancel,
@@ -175,7 +173,6 @@ fn run_clamscan(
     db_dir: PathBuf,
     recursive: bool,
     max_size_mb: u64,
-    max_threads: u32,
     scan_archives: bool,
     excludes: Vec<String>,
     cancel: Arc<Mutex<bool>>,
@@ -202,12 +199,6 @@ fn run_clamscan(
 
     cmd.arg(format!("--max-filesize={}M", max_size_mb));
     cmd.arg(format!("--max-scansize={}M", max_size_mb * 4));
-
-    // Use user-configured scan thread count when possible.
-    // Keep arguments conservative for compatibility across ClamAV versions.
-    if max_threads > 1 {
-        cmd.arg(format!("--max-threads={}", max_threads));
-    }
 
     if !scan_archives {
         cmd.arg("--no-archive");
