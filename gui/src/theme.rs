@@ -69,28 +69,76 @@ pub fn apply_theme(ctx: &egui::Context, dark_mode: bool) {
     style.visuals = visuals;
     ctx.set_style(style);
 
-    // Try to load custom font, fallback to default if not available
-    let font_path = std::path::Path::new("fonts/NotoSansSC-Regular.ttf");
-    if font_path.exists() {
-        if let Ok(font_data) = std::fs::read(font_path) {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts.font_data.insert(
-                "sys".to_owned(),
-                std::sync::Arc::new(egui::FontData::from_owned(font_data)),
-            );
-            fonts
-                .families
-                .entry(FontFamily::Proportional)
-                .or_default()
-                .insert(0, "sys".to_owned());
-            fonts
-                .families
-                .entry(FontFamily::Monospace)
-                .or_default()
-                .push("sys".to_owned());
-            ctx.set_fonts(fonts);
+    // Try to load Chinese font with fallback chain
+    let font_data = load_chinese_font();
+    
+    if let Some(data) = font_data {
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "chinese".to_owned(),
+            std::sync::Arc::new(egui::FontData::from_owned(data)),
+        );
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, "chinese".to_owned());
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .push("chinese".to_owned());
+        ctx.set_fonts(fonts);
+    }
+}
+
+/// Load Chinese font with fallback chain:
+/// 1. Local fonts/NotoSansSC-Regular.ttf (for packaged builds)
+/// 2. System fonts (for development)
+fn load_chinese_font() -> Option<Vec<u8>> {
+    // Try local font first
+    let local_font = std::path::Path::new("fonts/NotoSansSC-Regular.ttf");
+    if local_font.exists() {
+        if let Ok(data) = std::fs::read(local_font) {
+            return Some(data);
         }
     }
+
+    // Fallback to system fonts
+    #[cfg(target_os = "windows")]
+    {
+        let system_fonts = [
+            "C:\\Windows\\Fonts\\msyh.ttc",      // Microsoft YaHei
+            "C:\\Windows\\Fonts\\simsun.ttc",    // SimSun
+            "C:\\Windows\\Fonts\\simhei.ttf",    // SimHei
+            "C:\\Windows\\Fonts\\msyhbd.ttc",    // YaHei Bold
+            "C:\\Windows\\Fonts\\simkai.ttf",    // KaiTi
+        ];
+
+        for font_path in &system_fonts {
+            if let Ok(data) = std::fs::read(font_path) {
+                return Some(data);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // For non-Windows platforms, try common Chinese font locations
+        let system_fonts = [
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/System/Library/Fonts/PingFang.ttc",
+        ];
+
+        for font_path in &system_fonts {
+            if let Ok(data) = std::fs::read(font_path) {
+                return Some(data);
+            }
+        }
+    }
+
+    None
 }
 
 pub fn heading(text: &str) -> egui::RichText {
