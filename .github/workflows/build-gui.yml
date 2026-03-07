@@ -22,19 +22,19 @@ jobs:
           arch: amd64
 
       - name: Install Rust
-        uses: dtolnay/rust-action/setup@v1
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache vcpkg
         uses: actions/cache@v4
         with:
-          path: C:\vcpkg\installed
+          path: ${{ github.workspace }}\vcpkg_installed
           key: vcpkg-x64-windows-${{ hashFiles('vcpkg.json') }}
           restore-keys: vcpkg-x64-windows-
 
       - name: Install vcpkg dependencies
-        run: vcpkg install --triplet x64-windows
-        env:
-          VCPKG_ROOT: C:\vcpkg
+        run: |
+          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows
+        shell: pwsh
 
       - name: Cache Rust build
         uses: actions/cache@v4
@@ -51,7 +51,7 @@ jobs:
           mkdir build -ErrorAction SilentlyContinue
           cd build
           cmake .. -A x64 `
-            -D CMAKE_TOOLCHAIN_FILE="C:\vcpkg\scripts\buildsystems\vcpkg.cmake" `
+            -D CMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
             -D CMAKE_INSTALL_PREFIX="install" `
             -D ENABLE_TESTS=OFF `
             -D ENABLE_MILTER=OFF `
@@ -68,7 +68,16 @@ jobs:
       - name: Prepare Chinese font
         run: |
           New-Item -ItemType Directory -Path gui\fonts -Force | Out-Null
-          Copy-Item "C:\Windows\Fonts\msyh.ttc" "gui\fonts\NotoSansSC-Regular.ttf" -Force
+          # Try Microsoft YaHei first, fall back to SimSun
+          $fontSrc = @("$env:SystemRoot\Fonts\msyh.ttc", "$env:SystemRoot\Fonts\simsun.ttc", "$env:SystemRoot\Fonts\malgun.ttf") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($fontSrc) {
+            Copy-Item $fontSrc "gui\fonts\NotoSansSC-Regular.ttf" -Force
+            Write-Host "Font copied from: $fontSrc"
+          } else {
+            Write-Host "::warning::No CJK font found, downloading Noto Sans SC"
+            Invoke-WebRequest -Uri 'https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansSC-Regular.otf' -OutFile 'gui\fonts\NotoSansSC-Regular.ttf' -UseBasicParsing
+          }
+        shell: pwsh
 
       - name: Build GUI
         run: |
@@ -96,8 +105,7 @@ jobs:
           Copy-Item "gui\target\release\clamav-gui.exe" "$outputDir\ClamAV-Scanner.exe"
 
           # Copy ClamAV executables
-          $exes = @("clamscan.exe","freshclam.exe","clamd.exe","clamdscan.exe",
-                    "clamconf.exe","sigtool.exe","clambc.exe","clamdtop.exe","clamsubmit.exe")
+          $exes = @("clamscan.exe","freshclam.exe","clamd.exe","clamdscan.exe")
           foreach ($exe in $exes) {
             $src = "$clamavInstall\$exe"
             if (Test-Path $src) { Copy-Item $src "$outputDir\clamav\$exe" }
