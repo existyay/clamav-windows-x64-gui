@@ -120,7 +120,7 @@ impl ClamAvApp {
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                 ui.add_space(12.0);
                 ui.label(
-                    egui::RichText::new("v1.0.0")
+                    egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
                         .font(FontId::proportional(11.0))
                         .color(theme::text_secondary(dark_mode)),
                 );
