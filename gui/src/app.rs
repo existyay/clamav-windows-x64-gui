@@ -903,6 +903,10 @@ impl ClamAvApp {
 
             ui.add_space(8.0);
             ui.checkbox(&mut self.config.auto_update, "启动时自动更新病毒库");
+            ui.checkbox(
+                &mut self.config.persist_realtime_on_exit,
+                "退出 GUI 后保留实时保护进程",
+            );
 
             ui.add_space(16.0);
 
@@ -964,6 +968,16 @@ impl ClamAvApp {
                     );
                 }
             });
+    }
+}
+
+impl Drop for ClamAvApp {
+    fn drop(&mut self) {
+        if !self.config.persist_realtime_on_exit
+            && self.realtime.state == RealtimeState::Running
+        {
+            self.realtime.stop();
+        }
     }
 }
 

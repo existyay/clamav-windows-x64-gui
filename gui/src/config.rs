@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub recursive_scan: bool,
     pub exclude_patterns: Vec<String>,
     pub auto_update: bool,
+    #[serde(default)]
+    pub persist_realtime_on_exit: bool,
 }
 
 impl Default for AppConfig {
@@ -39,6 +41,7 @@ impl Default for AppConfig {
             recursive_scan: true,
             exclude_patterns: vec![],
             auto_update: true,
+            persist_realtime_on_exit: false,
         }
     }
 }
