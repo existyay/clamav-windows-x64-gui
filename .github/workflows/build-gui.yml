@@ -1,0 +1,153 @@
+name: Build ClamAV GUI
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Install Rust
+        uses: dtolnay/rust-action/setup@v1
+
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-x64-windows-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-x64-windows-
+
+      - name: Install vcpkg dependencies
+        run: vcpkg install --triplet x64-windows
+        env:
+          VCPKG_ROOT: C:\vcpkg
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            gui\target
+            ~\.cargo\registry
+            ~\.cargo\git
+          key: rust-release-${{ hashFiles('gui/Cargo.lock') }}
+          restore-keys: rust-release-
+
+      - name: Configure ClamAV (CMake)
+        run: |
+          mkdir build -ErrorAction SilentlyContinue
+          cd build
+          cmake .. -A x64 `
+            -D CMAKE_TOOLCHAIN_FILE="C:\vcpkg\scripts\buildsystems\vcpkg.cmake" `
+            -D CMAKE_INSTALL_PREFIX="install" `
+            -D ENABLE_TESTS=OFF `
+            -D ENABLE_MILTER=OFF `
+            -D ENABLE_EXAMPLES=OFF `
+            -D ENABLE_MAN_PAGES=OFF `
+            -D ENABLE_DOXYGEN=OFF
+
+      - name: Build ClamAV
+        run: |
+          cd build
+          cmake --build . --config Release
+          cmake --build . --config Release --target install
+
+      - name: Prepare Chinese font
+        run: |
+          New-Item -ItemType Directory -Path gui\fonts -Force | Out-Null
+          Copy-Item "C:\Windows\Fonts\msyh.ttc" "gui\fonts\NotoSansSC-Regular.ttf" -Force
+
+      - name: Build GUI
+        run: |
+          cd gui
+          cargo build --release
+        env:
+          OPENSSL_DIR: ${{ github.workspace }}\vcpkg_installed\x64-windows
+          OPENSSL_LIB_DIR: ${{ github.workspace }}\vcpkg_installed\x64-windows\lib
+          OPENSSL_INCLUDE_DIR: ${{ github.workspace }}\vcpkg_installed\x64-windows\include
+
+      - name: Package portable distribution
+        run: |
+          $outputDir = "dist\ClamAV-GUI-Portable"
+          $clamavInstall = "build\install"
+
+          # Create directories
+          New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+          New-Item -ItemType Directory -Path "$outputDir\clamav" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$outputDir\clamav\database" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$outputDir\clamav\certs" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$outputDir\quarantine" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$outputDir\logs" -Force | Out-Null
+
+          # Copy GUI
+          Copy-Item "gui\target\release\clamav-gui.exe" "$outputDir\ClamAV-Scanner.exe"
+
+          # Copy ClamAV executables
+          $exes = @("clamscan.exe","freshclam.exe","clamd.exe","clamdscan.exe",
+                    "clamconf.exe","sigtool.exe","clambc.exe","clamdtop.exe","clamsubmit.exe")
+          foreach ($exe in $exes) {
+            $src = "$clamavInstall\$exe"
+            if (Test-Path $src) { Copy-Item $src "$outputDir\clamav\$exe" }
+          }
+
+          # Copy DLLs
+          Get-ChildItem "$clamavInstall\*.dll" | ForEach-Object {
+            Copy-Item $_.FullName "$outputDir\clamav\$($_.Name)"
+          }
+
+          # Copy certs
+          Copy-Item "$clamavInstall\certs\*" "$outputDir\clamav\certs\" -Recurse -ErrorAction SilentlyContinue
+
+          # Config files
+          @"
+          DatabaseMirror database.clamav.net
+          Foreground yes
+          MaxAttempts 3
+          ConnectTimeout 30
+          "@ | Set-Content "$outputDir\clamav\freshclam.conf"
+
+          @"
+          TCPSocket 3310
+          TCPAddr 127.0.0.1
+          Foreground yes
+          MaxThreads 4
+          "@ | Set-Content "$outputDir\clamav\clamd.conf"
+
+          # License
+          if (Test-Path "$clamavInstall\COPYING.txt") {
+            Copy-Item "$clamavInstall\COPYING.txt" "$outputDir\LICENSE.txt"
+          }
+
+          # Create ZIP
+          Compress-Archive -Path "$outputDir\*" -DestinationPath "dist\ClamAV-GUI-Portable-x64.zip" -CompressionLevel Optimal
+
+          $size = [math]::Round((Get-Item "dist\ClamAV-GUI-Portable-x64.zip").Length / 1MB, 1)
+          Write-Host "Package created: $size MB"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClamAV-GUI-Portable-x64
+          path: dist/ClamAV-GUI-Portable-x64.zip
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/ClamAV-GUI-Portable-x64.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: false

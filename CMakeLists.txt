@@ -1105,36 +1105,34 @@ if(NOT ENABLE_LIBCLAMAV_ONLY)
 
     if(ENABLE_APP)
         # Build targets for primary applications.
-        add_subdirectory( clamconf )
+        # add_subdirectory( clamconf )    # Removed: not needed for GUI
 
         add_subdirectory( clamd )
 
         add_subdirectory( clamdscan )
 
         if(C_LINUX AND ENABLE_CLAMONACC)
-            add_subdirectory( clamonacc )
+            # add_subdirectory( clamonacc )  # Removed: Linux only
         endif()
 
         if(ENABLE_MILTER)
-            add_subdirectory( clamav-milter )
+            # add_subdirectory( clamav-milter )  # Removed: Linux only
         endif()
 
         add_subdirectory( clamscan )
 
-        add_subdirectory( sigtool )
-
-        add_subdirectory( clambc )
-
-        add_subdirectory( clamsubmit )
+        # add_subdirectory( sigtool )     # Removed: not needed for GUI
+        # add_subdirectory( clambc )      # Removed: not needed for GUI
+        # add_subdirectory( clamsubmit )  # Removed: not needed for GUI
 
         add_subdirectory( freshclam )
 
-        add_subdirectory( clamdtop )
+        # add_subdirectory( clamdtop )    # Removed: not needed for GUI
 
         if(WIN32)
             add_subdirectory( win32/conf_examples )
-        else()
-            add_subdirectory( etc )
+        # else()
+        #     add_subdirectory( etc )     # Removed: Linux only
         endif()
 
         add_subdirectory( certs )

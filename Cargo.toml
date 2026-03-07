@@ -3,6 +3,7 @@
 members = [
     "libclamav_rust",
 ]
+exclude = ["gui"]
 
 [profile.dev.package."*"]
 opt-level = 2
