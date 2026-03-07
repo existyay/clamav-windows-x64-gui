@@ -922,14 +922,26 @@ impl ClamAvApp {
             }
         }
 
-        // Update log
-        if !self.updater.log_lines.is_empty() {
-            ui.add_space(12.0);
-            ui.label(theme::subheading("更新日志"));
-            egui::ScrollArea::vertical()
-                .max_height(300.0)
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
+        // Update log - always show, even if empty during update
+        ui.add_space(12.0);
+        ui.label(theme::subheading("更新日志"));
+        egui::ScrollArea::vertical()
+            .id_salt("update_log")
+            .max_height(300.0)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                if self.updater.log_lines.is_empty() {
+                    let msg = if self.updater.state == UpdateState::Updating {
+                        "Connecting..."
+                    } else {
+                        "No logs - Click 'Start Update' button above"
+                    };
+                    ui.label(
+                        egui::RichText::new(msg)
+                            .font(FontId::monospace(12.0))
+                            .color(theme::text_secondary(dark_mode)),
+                    );
+                } else {
                     for line in &self.updater.log_lines {
                         ui.label(
                             egui::RichText::new(line)
@@ -937,8 +949,8 @@ impl ClamAvApp {
                                 .color(theme::text_secondary(dark_mode)),
                         );
                     }
-                });
-        }
+                }
+            });
     }
 
     fn quarantine_panel(&mut self, ui: &mut egui::Ui) {

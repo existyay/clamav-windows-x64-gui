@@ -430,6 +430,10 @@ fn run_scanner(
     for line in reader.lines() {
         if let Ok(cancelled) = cancel.lock() {
             if *cancelled {
+                // 杀死扫描进程
+                let _ = child.kill();
+                let _ = child.wait();
+                
                 let _ = tx.send(ScanMessage::Finished(ScanStats {
                     scanned_files: scanned,
                     infected_files: infected,

@@ -62,16 +62,26 @@ impl DatabaseUpdater {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
                     UpdateMessage::Progress(line) => {
+                        // Clean the line: remove progress chars, carriage returns, etc
+                        let cleaned = clean_log_line(&line);
+                        // Skip empty lines after cleaning
+                        if cleaned.is_empty() {
+                            continue;
+                        }
+                        
                         // Try to extract version info
-                        if line.contains("daily.cvd") || line.contains("main.cvd") {
-                            if let Some(ver) = extract_db_version(&line) {
+                        if cleaned.contains("daily.cvd") || cleaned.contains("main.cvd") {
+                            if let Some(ver) = extract_db_version(&cleaned) {
                                 self.db_version = Some(ver);
                             }
                         }
-                        self.log_lines.push(line);
+                        self.log_lines.push(cleaned);
                     }
                     UpdateMessage::Finished(success, msg) => {
-                        self.log_lines.push(msg);
+                        let cleaned = clean_log_line(&msg);
+                        if !cleaned.is_empty() {
+                            self.log_lines.push(cleaned);
+                        }
                         if success {
                             self.last_update =
                                 Some(chrono::Local::now().format("%Y-%m-%d %H:%M").to_string());
@@ -79,7 +89,8 @@ impl DatabaseUpdater {
                         self.state = UpdateState::Done;
                     }
                     UpdateMessage::Error(e) => {
-                        self.log_lines.push(format!("Error: {}", e));
+                        let error_msg = format!("❌ 错误: {}", e);
+                        self.log_lines.push(error_msg);
                         self.state = UpdateState::Done;
                     }
                 }
@@ -191,7 +202,7 @@ fn run_freshclam(
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
 
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             let _ = tx.send(UpdateMessage::Error(format!(
@@ -202,7 +213,7 @@ fn run_freshclam(
         }
     };
 
-    let stdout = match child.stdout {
+    let stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
             let _ = tx.send(UpdateMessage::Error("No stdout".into()));
@@ -210,22 +221,82 @@ fn run_freshclam(
         }
     };
 
-    let reader = BufReader::new(stdout);
-    for line in reader.lines() {
-        match line {
-            Ok(l) => {
-                let _ = tx.send(UpdateMessage::Progress(l));
-            }
-            Err(e) => {
-                let _ = tx.send(UpdateMessage::Error(e.to_string()));
+    let stderr = match child.stderr.take() {
+        Some(s) => s,
+        None => {
+            let _ = tx.send(UpdateMessage::Error("No stderr".into()));
+            return;
+        }
+    };
+
+    // Send initial message of starting update
+    let _ = tx.send(UpdateMessage::Progress("🔄 正在更新病毒库...".to_string()));
+
+    // Read stdout in current thread
+    let tx_stdout = tx.clone();
+    let stdout_thread = std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(l) => {
+                    if !l.trim().is_empty() {
+                        let _ = tx_stdout.send(UpdateMessage::Progress(l));
+                    }
+                }
+                Err(e) => {
+                    let _ = tx_stdout.send(UpdateMessage::Error(format!("读取stdout失败: {}", e)));
+                }
             }
         }
-    }
+    });
 
-    let _ = tx.send(UpdateMessage::Finished(
-        true,
-        "Database update complete.".into(),
-    ));
+    // Read stderr in another thread (freshclam often logs to stderr)
+    let tx_stderr = tx.clone();
+    let stderr_thread = std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(l) => {
+                    if !l.trim().is_empty() {
+                        let _ = tx_stderr.send(UpdateMessage::Progress(l));
+                    }
+                }
+                Err(e) => {
+                    let _ = tx_stderr.send(UpdateMessage::Error(format!("读取stderr失败: {}", e)));
+                }
+            }
+        }
+    });
+
+    // Wait for child process to complete
+    let exit_status = child.wait();
+    
+    // Wait for reader threads to finish
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+
+    match exit_status {
+        Ok(status) => {
+            if status.success() {
+                let _ = tx.send(UpdateMessage::Finished(
+                    true,
+                    "✅ 病毒库更新完成".to_string(),
+                ));
+            } else {
+                let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "unknown".to_string());
+                let _ = tx.send(UpdateMessage::Finished(
+                    false,
+                    format!("⚠ freshclam 进程以代码 {} 退出", code),
+                ));
+            }
+        }
+        Err(e) => {
+            let _ = tx.send(UpdateMessage::Error(format!(
+                "等待 freshclam 进程失败: {}",
+                e
+            )));
+        }
+    }
 }
 
 fn extract_db_version(line: &str) -> Option<String> {
@@ -236,4 +307,30 @@ fn extract_db_version(line: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn clean_log_line(line: &str) -> String {
+    // Remove progress bar characters, carriage returns, and control chars
+    let cleaned = line
+        .chars()
+        .filter(|c| {
+            // Keep printable chars and newlines
+            !c.is_control() || *c == '\n'
+        })
+        .collect::<String>();
+    
+    // Split by carriage return (progress bar handling)
+    // and take the last non-empty part (the actual message)
+    let parts: Vec<&str> = cleaned.split('\r').collect();
+    let last_part = parts.last().unwrap_or(&"").trim();
+    
+    // Further clean: remove ANSI color codes if present
+    let no_ansi = last_part
+        .chars()
+        .fold(String::new(), |mut acc, c| {
+            acc.push(c);
+            acc
+        });
+    
+    no_ansi.trim().to_string()
 }
