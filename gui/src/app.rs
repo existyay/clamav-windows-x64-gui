@@ -1238,11 +1238,15 @@ impl ClamAvApp {
 
 impl Drop for ClamAvApp {
     fn drop(&mut self) {
+        // Stop any active scan and kill the scan process
+        self.scan_engine.cancel_scan();
+
         if !self.config.persist_realtime_on_exit
             && self.realtime.state == RealtimeState::Running
         {
             self.realtime.stop();
         }
+        // ScanEngine::Drop will handle killing scan child + clamd daemon
     }
 }
 

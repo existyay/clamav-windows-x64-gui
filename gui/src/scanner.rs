@@ -144,6 +144,7 @@ pub struct ScanEngine {
     pub current_file: String,
     pub scan_started_at: Option<std::time::Instant>,
     pub clamd_daemon: ClamdDaemon,
+    scan_child_id: Arc<Mutex<Option<u32>>>,
 }
 
 impl Default for ScanEngine {
@@ -158,6 +159,7 @@ impl Default for ScanEngine {
             current_file: String::new(),
             scan_started_at: None,
             clamd_daemon: ClamdDaemon::new(),
+            scan_child_id: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -219,6 +221,7 @@ impl ScanEngine {
         let max_size = config.max_file_size_mb;
         let scan_archives = config.scan_archives;
         let excludes = config.exclude_patterns.clone();
+        let scan_child_id = self.scan_child_id.clone();
 
         std::thread::spawn(move || {
             run_scanner(
@@ -231,14 +234,22 @@ impl ScanEngine {
                 scan_archives,
                 excludes,
                 cancel,
+                scan_child_id,
                 tx,
             );
         });
     }
 
     pub fn cancel_scan(&mut self) {
+        // Set cancel flag
         if let Ok(mut flag) = self.cancel_flag.lock() {
             *flag = true;
+        }
+        // Kill the scan process directly via PID (unblocks reader.lines())
+        if let Ok(mut pid) = self.scan_child_id.lock() {
+            if let Some(id) = pid.take() {
+                kill_process_tree(id);
+            }
         }
         self.state = ScanState::Idle;
         self.scan_started_at = None;
@@ -303,6 +314,39 @@ impl ScanEngine {
     }
 }
 
+impl Drop for ScanEngine {
+    fn drop(&mut self) {
+        // Kill any running scan process on cleanup
+        if let Ok(mut pid) = self.scan_child_id.lock() {
+            if let Some(id) = pid.take() {
+                kill_process_tree(id);
+            }
+        }
+        // clamd_daemon is dropped automatically via its own Drop impl
+    }
+}
+
+fn kill_process_tree(pid: u32) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x08000000)
+            .status();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 fn run_scanner(
     scanner_path: PathBuf,
     use_daemon: bool,
@@ -313,6 +357,7 @@ fn run_scanner(
     scan_archives: bool,
     excludes: Vec<String>,
     cancel: Arc<Mutex<bool>>,
+    scan_child_id: Arc<Mutex<Option<u32>>>,
     tx: mpsc::Sender<ScanMessage>,
 ) {
     if !scanner_path.exists() {
@@ -333,11 +378,9 @@ fn run_scanner(
         if recursive {
             cmd.arg("--multiscan");  // 多线程扫描
         }
-
-        // clamdscan 不需要指定数据库路径，由 clamd 管理
     } else {
         // clamscan 参数（独立扫描）
-        cmd.arg("--verbose");  // 启用详细输出以获取完整统计信息
+        cmd.arg("--verbose");
         cmd.arg("--stdout");
 
         if db_dir.exists() {
@@ -348,11 +391,8 @@ fn run_scanner(
             cmd.arg("--recursive");
         }
 
-        // 文件大小限制
         cmd.arg(format!("--max-filesize={}M", max_size_mb));
         cmd.arg(format!("--max-scansize={}M", max_size_mb * 4));
-
-        // 性能优化选项
         cmd.arg("--max-dir-recursion=15");
         cmd.arg("--pcre-match-limit=10000");
         cmd.arg("--pcre-recmatch-limit=5000");
@@ -362,14 +402,12 @@ fn run_scanner(
         }
     }
 
-    // 排除模式（两种扫描器都支持）
     for pat in &excludes {
         if !pat.is_empty() {
             cmd.arg(format!("--exclude={}", pat));
         }
     }
 
-    // 添加扫描目标
     for target in &targets {
         cmd.arg(target.to_string_lossy().as_ref());
     }
@@ -377,7 +415,6 @@ fn run_scanner(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    // Hide console window on Windows
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
@@ -390,17 +427,23 @@ fn run_scanner(
         Ok(c) => c,
         Err(e) => {
             let _ = tx.send(ScanMessage::Error(format!(
-                "Failed to start clamscan: {}",
+                "启动扫描器失败: {}",
                 e
             )));
             return;
         }
     };
 
+    // Store child PID for external kill (cancel_scan / Drop)
+    let child_id = child.id();
+    if let Ok(mut pid) = scan_child_id.lock() {
+        *pid = Some(child_id);
+    }
+
     let stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
-            let _ = tx.send(ScanMessage::Error("No stdout from clamscan".into()));
+            let _ = tx.send(ScanMessage::Error("No stdout from scanner".into()));
             return;
         }
     };
@@ -428,20 +471,10 @@ fn run_scanner(
     let mut last_stats_update = std::time::Instant::now();
 
     for line in reader.lines() {
-        if let Ok(cancelled) = cancel.lock() {
-            if *cancelled {
-                // 杀死扫描进程
-                let _ = child.kill();
-                let _ = child.wait();
-                
-                let _ = tx.send(ScanMessage::Finished(ScanStats {
-                    scanned_files: scanned,
-                    infected_files: infected,
-                    scanned_data_mb,
-                    elapsed_secs: start.elapsed().as_secs_f64(),
-                }));
-                return;
-            }
+        // Check cancel flag (secondary check - primary kill is via cancel_scan)
+        let is_cancelled = cancel.lock().map(|f| *f).unwrap_or(false);
+        if is_cancelled {
+            break;
         }
 
         let line = match line {
@@ -450,21 +483,32 @@ fn run_scanner(
         };
 
         if line.contains("FOUND") {
+            // Infected file found (works for both clamscan and clamdscan)
             infected += 1;
+            scanned += 1;
             let parts: Vec<&str> = line.splitn(2, ':').collect();
             if parts.len() == 2 {
                 let file_path = parts[0].trim().to_string();
                 let threat_name = parts[1].trim().trim_end_matches("FOUND").trim().to_string();
                 let _ = tx.send(ScanMessage::ThreatFound(ThreatInfo {
-                    file_path,
+                    file_path: file_path.clone(),
                     threat_name,
                 }));
+                let _ = tx.send(ScanMessage::Progress(file_path));
             }
         } else if line.contains(": OK") {
-            // 仅在 verbose 模式下更新扫描文件统计（减少消息频率）
+            // Clean file (works for both clamscan and clamdscan)
             scanned += 1;
-            
-            // 定期发送进度更新（每秒一次）
+
+            // Extract file path for progress display (critical for clamdscan mode)
+            if let Some(path) = line.split(": OK").next() {
+                let path = path.trim();
+                if !path.is_empty() {
+                    let _ = tx.send(ScanMessage::Progress(path.to_string()));
+                }
+            }
+
+            // Throttled stats update (once per second)
             if last_stats_update.elapsed().as_secs_f64() > 1.0 {
                 let _ = tx.send(ScanMessage::Stats(ScanStats {
                     scanned_files: scanned,
@@ -475,13 +519,11 @@ fn run_scanner(
                 last_stats_update = std::time::Instant::now();
             }
         } else if line.starts_with("Scanning") {
-            // 更新当前正在扫描的文件
+            // clamscan verbose mode: "Scanning /path/file"
             let file = line.replace("Scanning", "").trim().to_string();
             if !file.is_empty() {
                 let _ = tx.send(ScanMessage::Progress(file));
             }
-        } else if line.starts_with("-------") {
-            // Summary section begins，准备等待统计行
         } else if line.contains("Scanned files:") {
             if let Some(n) = extract_number(&line) {
                 scanned = n;
@@ -497,10 +539,30 @@ fn run_scanner(
         }
     }
 
+    // Clear PID - process is about to exit
+    if let Ok(mut pid) = scan_child_id.lock() {
+        *pid = None;
+    }
+
+    // Check if cancelled
+    let was_cancelled = cancel.lock().map(|f| *f).unwrap_or(false);
+    if was_cancelled {
+        // Process was killed externally, just reap and send final stats
+        let _ = child.wait();
+        let _ = stderr_handle.join();
+        let _ = tx.send(ScanMessage::Finished(ScanStats {
+            scanned_files: scanned,
+            infected_files: infected,
+            scanned_data_mb,
+            elapsed_secs: start.elapsed().as_secs_f64(),
+        }));
+        return;
+    }
+
     let status = child.wait();
     let stderr_text = stderr_handle.join().unwrap_or_default();
 
-    // 发送最终统计信息
+    // Send final stats (use counted values as authoritative)
     let _ = tx.send(ScanMessage::Stats(ScanStats {
         scanned_files: scanned,
         infected_files: infected,
@@ -509,18 +571,15 @@ fn run_scanner(
     }));
 
     if let Ok(exit_status) = status {
-        if !exit_status.success() {
-            let code = exit_status.code().map_or("unknown".to_string(), |c| c.to_string());
+        let code = exit_status.code().unwrap_or(-1);
+        // Exit code 0 = clean, 1 = virus found (not an error!), 2+ = error
+        if code >= 2 {
             let details = if stderr_text.is_empty() {
-                "扫描器退出时返回非零状态".to_string()
+                format!("扫描器退出代码: {}", code)
             } else {
                 stderr_text
             };
-
-            let _ = tx.send(ScanMessage::Error(format!(
-                "扫描失败 (exit code {}): {}",
-                code, details
-            )));
+            let _ = tx.send(ScanMessage::Error(details));
             return;
         }
     } else if let Err(e) = status {

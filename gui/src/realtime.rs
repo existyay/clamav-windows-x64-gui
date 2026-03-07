@@ -240,8 +240,8 @@ fn realtime_watch_loop(
                 }
 
                 match cmd.spawn() {
-                    Ok(child) => {
-                        if let Some(stdout) = child.stdout {
+                    Ok(mut child) => {
+                        if let Some(stdout) = child.stdout.take() {
                             let reader = BufReader::new(stdout);
                             for line in reader.lines().filter_map(|l| l.ok()) {
                                 if line.contains("FOUND") {
@@ -275,6 +275,8 @@ fn realtime_watch_loop(
                                 }
                             }
                         }
+                        // Wait for process to fully exit and release handles
+                        let _ = child.wait();
                     }
                     Err(e) => {
                         let _ = tx.send(RealtimeMessage::Error(format!(
