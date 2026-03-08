@@ -1,9 +1,7 @@
 use crate::config::AppConfig;
 use std::io::{BufRead, BufReader};
-use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub enum UpdateMessage {
@@ -152,31 +150,9 @@ impl DatabaseUpdater {
 }
 
 fn ensure_freshclam_conf(conf_path: &std::path::Path, db_dir: &std::path::Path, certs_dir: &std::path::Path) {
-    // 每次更新前重新检测镜像可用性并生成配置
-    let mirrors = [
-        "mirrors.tuna.tsinghua.edu.cn",
-        "mirrors.ustc.edu.cn",
-        "mirrors.nju.edu.cn",
-    ];
-
-    let reachable: Vec<&str> = mirrors
-        .iter()
-        .filter(|host| test_mirror_reachable(host))
-        .copied()
-        .collect();
-
     let mut content = String::new();
-    if reachable.is_empty() {
-        content.push_str("# 国内镜像不可用，使用官方源\n");
-        content.push_str("DatabaseMirror database.clamav.net\n\n");
-    } else {
-        content.push_str("# 可用的国内镜像源\n");
-        for host in &reachable {
-            content.push_str(&format!("PrivateMirror {}\n", host));
-        }
-        content.push('\n');
-    }
-
+    content.push_str("# ClamAV official database mirror\n");
+    content.push_str("DatabaseMirror database.clamav.net\n\n");
     content.push_str(&format!("DatabaseDirectory {}\n", db_dir.display()));
     content.push_str(&format!("CVDCertsDirectory {}\n", certs_dir.display()));
     content.push_str("Foreground yes\n");
@@ -185,19 +161,6 @@ fn ensure_freshclam_conf(conf_path: &std::path::Path, db_dir: &std::path::Path, 
     content.push_str("ReceiveTimeout 60\n");
 
     let _ = std::fs::write(conf_path, content);
-}
-
-/// 测试镜像主机是否可达（TCP 连接 80 端口，3 秒超时）
-fn test_mirror_reachable(host: &str) -> bool {
-    use std::net::ToSocketAddrs;
-    let addr = match format!("{}:80", host).to_socket_addrs() {
-        Ok(mut addrs) => match addrs.next() {
-            Some(a) => a,
-            None => return false,
-        },
-        Err(_) => return false,
-    };
-    TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok()
 }
 
 fn run_freshclam(
