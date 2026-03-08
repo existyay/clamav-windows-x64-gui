@@ -1,21 +1,17 @@
 use crate::config::AppConfig;
-use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-use notify::Watcher;
 
 #[derive(Clone, Debug)]
 pub enum RealtimeMessage {
     ThreatFound {
-        file_path: String,
-        threat_name: String,
+        rule_name: String,
+        description: String,
     },
-    FileScanned(String),
+    Info(String),
     Error(String),
     Stopped,
 }
@@ -35,7 +31,6 @@ pub struct RealtimeThreat {
 
 pub struct RealtimeProtection {
     pub state: RealtimeState,
-    pub watch_dirs: Vec<PathBuf>,
     pub threats: Vec<RealtimeThreat>,
     pub scanned_count: u64,
     pub log_lines: Vec<String>,
@@ -47,7 +42,6 @@ impl Default for RealtimeProtection {
     fn default() -> Self {
         Self {
             state: RealtimeState::Stopped,
-            watch_dirs: vec![],
             threats: Vec::new(),
             scanned_count: 0,
             log_lines: Vec::new(),
@@ -63,6 +57,15 @@ impl RealtimeProtection {
             return;
         }
 
+        let yamagoya = config.yamagoya_path();
+        if !yamagoya.exists() {
+            self.log_lines.push(format!(
+                "ERROR: YAMAGoya 未找到: {}",
+                yamagoya.display()
+            ));
+            return;
+        }
+
         let cancel = Arc::new(Mutex::new(false));
         self.cancel_flag = cancel.clone();
         self.state = RealtimeState::Running;
@@ -70,17 +73,21 @@ impl RealtimeProtection {
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
 
-        let watch_dirs = if self.watch_dirs.is_empty() {
-            default_watch_dirs()
-        } else {
-            self.watch_dirs.clone()
-        };
-
-        let clamscan = config.clamscan_path();
-        let db_dir = config.database_dir.clone();
+        let rules_dir = config.yamagoya_rules_dir.clone();
+        let rule_type = config.yamagoya_rule_type.clone();
+        let monitor_all = config.yamagoya_monitor_all;
+        let kill_process = config.yamagoya_kill_process;
 
         std::thread::spawn(move || {
-            realtime_watch_loop(clamscan, db_dir, watch_dirs, cancel, tx);
+            yamagoya_watch_loop(
+                yamagoya,
+                rules_dir,
+                rule_type,
+                monitor_all,
+                kill_process,
+                cancel,
+                tx,
+            );
         });
     }
 
@@ -96,31 +103,30 @@ impl RealtimeProtection {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
                     RealtimeMessage::ThreatFound {
-                        file_path,
-                        threat_name,
+                        rule_name,
+                        description,
                     } => {
                         let ts =
                             chrono::Local::now().format("%H:%M:%S").to_string();
                         self.log_lines.push(format!(
-                            "[{}] ⚠ THREAT: {} -> {}",
-                            ts, file_path, threat_name
+                            "[{}] ⚠ DETECTED: {} - {}",
+                            ts, rule_name, description
                         ));
                         self.threats.push(RealtimeThreat {
-                            file_path,
-                            threat_name,
+                            file_path: description,
+                            threat_name: rule_name,
                             timestamp: ts,
                         });
-                        // Keep last 500
                         if self.threats.len() > 500 {
                             self.threats.drain(0..100);
                         }
                     }
-                    RealtimeMessage::FileScanned(path) => {
+                    RealtimeMessage::Info(text) => {
                         self.scanned_count += 1;
                         let ts =
                             chrono::Local::now().format("%H:%M:%S").to_string();
                         self.log_lines
-                            .push(format!("[{}] OK: {}", ts, path));
+                            .push(format!("[{}] {}", ts, text));
                         if self.log_lines.len() > 2000 {
                             self.log_lines.drain(0..500);
                         }
@@ -137,170 +143,63 @@ impl RealtimeProtection {
     }
 }
 
-fn default_watch_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        let downloads = home.join("Downloads");
-        if downloads.exists() {
-            dirs.push(downloads);
-        }
-        let desktop = home.join("Desktop");
-        if desktop.exists() {
-            dirs.push(desktop);
-        }
-        let documents = home.join("Documents");
-        if documents.exists() {
-            dirs.push(documents);
-        }
-    }
-    dirs
-}
-
-/// 基于 notify (Windows: ReadDirectoryChangesW) 的实时文件系统监控
-fn realtime_watch_loop(
-    clamscan: PathBuf,
-    db_dir: PathBuf,
-    watch_dirs: Vec<PathBuf>,
+/// 使用 YAMAGoya (ETW) 的实时监控循环
+fn yamagoya_watch_loop(
+    yamagoya_path: PathBuf,
+    rules_dir: PathBuf,
+    rule_type: String,
+    monitor_all: bool,
+    kill_process: bool,
     cancel: Arc<Mutex<bool>>,
     tx: mpsc::Sender<RealtimeMessage>,
 ) {
-    if !clamscan.exists() {
-        let _ = tx.send(RealtimeMessage::Error(format!(
-            "扫描器未找到: {}",
-            clamscan.display()
-        )));
-        let _ = tx.send(RealtimeMessage::Stopped);
-        return;
-    }
+    // 构建命令行参数
+    let mut args: Vec<String> = vec!["--session".to_string()];
 
-    // 创建文件系统事件通道
-    let (event_tx, event_rx) = mpsc::channel::<notify::Result<notify::Event>>();
-    let mut watcher = match notify::RecommendedWatcher::new(
-        move |res| {
-            let _ = event_tx.send(res);
-        },
-        notify::Config::default(),
-    ) {
-        Ok(w) => w,
-        Err(e) => {
-            let _ = tx.send(RealtimeMessage::Error(format!(
-                "无法创建文件系统监控器: {}",
-                e
-            )));
-            let _ = tx.send(RealtimeMessage::Stopped);
-            return;
-        }
-    };
-
-    // 注册监控目录
-    for dir in &watch_dirs {
-        match watcher.watch(dir, notify::RecursiveMode::Recursive) {
-            Ok(_) => {
-                let _ = tx.send(RealtimeMessage::FileScanned(format!(
-                    "开始监控: {}",
-                    dir.display()
-                )));
+    // 添加规则类型和目录
+    let rules_dir_str = rules_dir.to_string_lossy().to_string();
+    if rules_dir.exists() {
+        match rule_type.as_str() {
+            "sigma" => {
+                args.push("--sigma".to_string());
+                args.push(rules_dir_str);
             }
-            Err(e) => {
-                let _ = tx.send(RealtimeMessage::Error(format!(
-                    "无法监控目录 {}: {}",
-                    dir.display(),
-                    e
-                )));
+            "yara" => {
+                args.push("--yara".to_string());
+                args.push(rules_dir_str);
+            }
+            _ => {
+                args.push("--detect".to_string());
+                args.push(rules_dir_str);
             }
         }
     }
 
-    let mut pending_files: HashSet<PathBuf> = HashSet::new();
-    let mut last_scan = Instant::now();
-    let debounce = Duration::from_secs(2);
-
-    loop {
-        // 检查取消标志
-        if cancel.lock().map(|f| *f).unwrap_or(false) {
-            let _ = tx.send(RealtimeMessage::Stopped);
-            return;
-        }
-
-        // 接收文件系统事件（超时500ms）
-        match event_rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(Ok(event)) => {
-                match event.kind {
-                    notify::EventKind::Create(_) | notify::EventKind::Modify(_) => {
-                        for path in event.paths {
-                            if path.is_file()
-                                && !path.to_string_lossy().ends_with(".quarantine")
-                                && !path.to_string_lossy().ends_with(".meta")
-                            {
-                                pending_files.insert(path);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Err(e)) => {
-                let _ = tx.send(RealtimeMessage::Error(format!(
-                    "监控错误: {}",
-                    e
-                )));
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // 正常超时，继续循环
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = tx.send(RealtimeMessage::Error(
-                    "文件监控通道断开".to_string(),
-                ));
-                let _ = tx.send(RealtimeMessage::Stopped);
-                return;
-            }
-        }
-
-        // 去抖动: 积累文件后批量扫描
-        if !pending_files.is_empty() && last_scan.elapsed() >= debounce {
-            let files: Vec<PathBuf> = pending_files.drain().collect();
-
-            for chunk in files.chunks(20) {
-                if cancel.lock().map(|f| *f).unwrap_or(false) {
-                    let _ = tx.send(RealtimeMessage::Stopped);
-                    return;
-                }
-                scan_batch(&clamscan, &db_dir, chunk, &tx);
-            }
-
-            last_scan = Instant::now();
-        }
-    }
-}
-
-/// 批量扫描文件
-fn scan_batch(
-    clamscan: &PathBuf,
-    db_dir: &PathBuf,
-    files: &[PathBuf],
-    tx: &mpsc::Sender<RealtimeMessage>,
-) {
-    let mut cmd = Command::new(clamscan);
-    cmd.arg("--stdout").arg("--no-summary");
-
-    if db_dir.exists() {
-        cmd.arg(format!("--database={}", db_dir.display()));
+    // 监控类别
+    if monitor_all {
+        args.push("--all".to_string());
+    } else {
+        args.push("--file".to_string());
+        args.push("--process".to_string());
     }
 
-    // 显式指定证书目录，覆盖编译时硬编码的路径
-    let certs_dir = clamscan.parent().map(|p| p.join("certs"));
-    if let Some(ref cd) = certs_dir {
-        if cd.exists() {
-            cmd.arg(format!("--cvdcertsdir={}", cd.display()));
-        }
+    if kill_process {
+        args.push("--kill".to_string());
     }
 
-    for file in files {
-        cmd.arg(file);
-    }
+    args.push("--verbose".to_string());
+    args.push("--no_event_log".to_string());
 
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let _ = tx.send(RealtimeMessage::Info(format!(
+        "启动 YAMAGoya: {} {}",
+        yamagoya_path.display(),
+        args.join(" ")
+    )));
+
+    let mut cmd = Command::new(&yamagoya_path);
+    cmd.args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     #[cfg(target_os = "windows")]
     {
@@ -313,34 +212,91 @@ fn scan_batch(
             if let Some(stdout) = child.stdout.take() {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines().filter_map(|l| l.ok()) {
-                    if line.contains("FOUND") {
-                        let parts: Vec<&str> = line.splitn(2, ':').collect();
-                        if parts.len() == 2 {
-                            let file_path = parts[0].trim().to_string();
-                            let threat_name = parts[1]
-                                .trim()
-                                .trim_end_matches("FOUND")
-                                .trim()
-                                .to_string();
-                            let _ = tx.send(RealtimeMessage::ThreatFound {
-                                file_path,
-                                threat_name,
-                            });
+                    if cancel.lock().map(|f| *f).unwrap_or(false) {
+                        break;
+                    }
+
+                    if let Some(msg) = parse_yamagoya_line(&line) {
+                        if tx.send(msg).is_err() {
+                            break;
                         }
-                    } else if line.contains(": OK") {
-                        let path =
-                            line.split(':').next().unwrap_or("").trim().to_string();
-                        let _ = tx.send(RealtimeMessage::FileScanned(path));
                     }
                 }
             }
+
+            // 终止子进程
+            let _ = child.kill();
             let _ = child.wait();
+
+            // 清理 ETW 会话
+            stop_etw_session(&yamagoya_path);
         }
         Err(e) => {
             let _ = tx.send(RealtimeMessage::Error(format!(
-                "扫描出错: {}",
+                "启动 YAMAGoya 失败: {}",
                 e
             )));
         }
+    }
+
+    let _ = tx.send(RealtimeMessage::Stopped);
+}
+
+/// 停止 YAMAGoya ETW 会话
+fn stop_etw_session(yamagoya_path: &PathBuf) {
+    let mut cmd = Command::new(yamagoya_path);
+    cmd.arg("--stop");
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+
+    let _ = cmd.output();
+}
+
+/// 解析 YAMAGoya 的 stdout 输出行
+fn parse_yamagoya_line(line: &str) -> Option<RealtimeMessage> {
+    // [INFO] {timestamp} DETECTED (Sigma): {title} - {description}
+    if let Some(idx) = line.find("DETECTED (Sigma): ") {
+        let rest = &line[idx + "DETECTED (Sigma): ".len()..];
+        let (rule_name, description) = split_rule_desc(rest);
+        return Some(RealtimeMessage::ThreatFound {
+            rule_name,
+            description,
+        });
+    }
+
+    // [INFO] {timestamp} DETECTED: {rulename} - {description}
+    if let Some(idx) = line.find("DETECTED: ") {
+        let rest = &line[idx + "DETECTED: ".len()..];
+        // 跳过纯 PID 信息行
+        if rest.starts_with("PID=") {
+            return Some(RealtimeMessage::Info(line.to_string()));
+        }
+        let (rule_name, description) = split_rule_desc(rest);
+        return Some(RealtimeMessage::ThreatFound {
+            rule_name,
+            description,
+        });
+    }
+
+    if line.starts_with("[ERROR]") {
+        Some(RealtimeMessage::Error(line.to_string()))
+    } else {
+        Some(RealtimeMessage::Info(line.to_string()))
+    }
+}
+
+/// 从 "rulename - description" 格式中提取规则名和描述
+fn split_rule_desc(s: &str) -> (String, String) {
+    if let Some(dash_idx) = s.find(" - ") {
+        (
+            s[..dash_idx].to_string(),
+            s[dash_idx + 3..].to_string(),
+        )
+    } else {
+        (s.to_string(), String::new())
     }
 }

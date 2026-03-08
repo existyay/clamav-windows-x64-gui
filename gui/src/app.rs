@@ -235,7 +235,7 @@ impl ClamAvApp {
                 stat_card(ui, "📊", &self.scan_engine.stats.scanned_files.to_string(), "已扫描文件");
             });
             cols[1].vertical_centered(|ui| {
-                stat_card(ui, "🔍", &self.realtime.scanned_count.to_string(), "实时监控扫描");
+                stat_card(ui, "🔍", &self.realtime.scanned_count.to_string(), "ETW 事件监控");
             });
             cols[2].vertical_centered(|ui| {
                 let last_update = self.updater.last_update.clone()
@@ -512,15 +512,11 @@ impl ClamAvApp {
                         }
                     }
                     // 扫描被取消时显示“继续扫描”按钮
-                    if self.scan_engine.was_cancelled && has_target {
+                    if self.scan_engine.was_cancelled && !self.scan_engine.scan_target_paths.is_empty() {
                         if ui.add(theme::accent_button("▶ 继续扫描")).clicked() {
-                            let target_path = std::path::Path::new(&self.scan_target);
-                            if target_path.exists() && self.config.clamscan_path().exists() {
+                            if self.config.clamscan_path().exists() {
                                 self.auto_quarantine_pending = false;
-                                self.scan_engine.continue_scan(
-                                    std::path::PathBuf::from(&self.scan_target),
-                                    &self.config,
-                                );
+                                self.scan_engine.continue_scan_previous(&self.config);
                             }
                         }
                     }
@@ -800,9 +796,9 @@ impl ClamAvApp {
                         );
                         ui.label(
                             egui::RichText::new(if is_running {
-                                "正在监控文件变化，自动扫描新文件"
+                                "YAMAGoya ETW 监控运行中，实时检测系统行为"
                             } else {
-                                "点击下方按钮开启实时保护"
+                                "点击下方按钮开启实时保护 (需要管理员权限)"
                             })
                             .font(FontId::proportional(12.0))
                             .color(theme::text_secondary(dark_mode)),
@@ -820,57 +816,104 @@ impl ClamAvApp {
                     self.realtime.stop();
                 }
             } else {
-                if ui.add(theme::accent_button("▶ 启动保护")).clicked() {
+                let yamagoya_exists = self.config.yamagoya_path().exists();
+                let btn = ui.add_enabled(yamagoya_exists, theme::accent_button("▶ 启动保护"));
+                if btn.clicked() {
                     self.realtime.start(&self.config);
+                }
+                if !yamagoya_exists {
+                    btn.on_hover_text(format!(
+                        "未找到 YAMAGoya.exe: {}",
+                        self.config.yamagoya_path().display()
+                    ));
                 }
             }
         });
 
         ui.add_space(12.0);
 
-        // Monitor dirs
-        ui.label(theme::subheading("监控目录"));
+        // YAMAGoya 配置
+        ui.label(theme::subheading("YAMAGoya 配置"));
         ui.add_space(4.0);
 
-        let watch_dirs = if self.realtime.watch_dirs.is_empty() {
-            let mut defaults = Vec::new();
-            if let Some(home) = dirs::home_dir() {
-                for sub in &["Downloads", "Desktop", "Documents"] {
-                    let p = home.join(sub);
-                    if p.exists() {
-                        defaults.push(p);
-                    }
+        // 规则目录
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("规则目录:")
+                    .font(FontId::proportional(12.0)),
+            );
+            let rules_path = self.config.yamagoya_rules_dir.to_string_lossy().to_string();
+            ui.label(
+                egui::RichText::new(if rules_path.is_empty() { "未设置" } else { &rules_path })
+                    .font(FontId::proportional(12.0))
+                    .color(if self.config.yamagoya_rules_dir.exists() {
+                        theme::text_primary(dark_mode)
+                    } else {
+                        theme::WARNING
+                    }),
+            );
+            if ui.add(theme::accent_button("📂 选择")).clicked() {
+                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                    self.config.yamagoya_rules_dir = folder;
+                    self.config.save();
                 }
             }
-            defaults
-        } else {
-            self.realtime.watch_dirs.clone()
-        };
+        });
 
-        for dir in &watch_dirs {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("📁")
-                        .font(FontId::proportional(14.0)),
-                );
-                ui.label(
-                    egui::RichText::new(dir.to_string_lossy())
-                        .font(FontId::proportional(12.0))
-                        .color(theme::text_primary(dark_mode)),
-                );
-            });
-        }
-
+        // 规则类型
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if ui.add(theme::accent_button("➕ 添加目录")).clicked() {
-                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                    self.realtime.watch_dirs.push(folder);
-                }
+            ui.label(
+                egui::RichText::new("规则类型:")
+                    .font(FontId::proportional(12.0)),
+            );
+            let mut changed = false;
+            if ui.radio_value(&mut self.config.yamagoya_rule_type, "sigma".to_string(), "Sigma").changed() {
+                changed = true;
             }
-            if !self.realtime.watch_dirs.is_empty() {
-                if ui.add(theme::danger_button("🗑 清除自定义")).clicked() {
-                    self.realtime.watch_dirs.clear();
+            if ui.radio_value(&mut self.config.yamagoya_rule_type, "yaml".to_string(), "YAML").changed() {
+                changed = true;
+            }
+            if ui.radio_value(&mut self.config.yamagoya_rule_type, "yara".to_string(), "YARA").changed() {
+                changed = true;
+            }
+            if changed {
+                self.config.save();
+            }
+        });
+
+        // 监控选项
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui.checkbox(&mut self.config.yamagoya_monitor_all, "监控所有事件类别").changed() {
+                self.config.save();
+            }
+            if ui.checkbox(&mut self.config.yamagoya_kill_process, "自动终止恶意进程").changed() {
+                self.config.save();
+            }
+        });
+
+        // YAMAGoya 路径
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("YAMAGoya 路径:")
+                    .font(FontId::proportional(11.0))
+                    .color(theme::text_secondary(dark_mode)),
+            );
+            ui.label(
+                egui::RichText::new(self.config.yamagoya_path().to_string_lossy())
+                    .font(FontId::proportional(11.0))
+                    .color(if self.config.yamagoya_path().exists() {
+                        theme::SUCCESS
+                    } else {
+                        theme::DANGER
+                    }),
+            );
+            if ui.add(theme::accent_button("📂 设置")).clicked() {
+                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                    self.config.yamagoya_dir = folder;
+                    self.config.save();
                 }
             }
         });
@@ -895,7 +938,7 @@ impl ClamAvApp {
                                     .color(theme::text_primary(dark_mode)),
                             );
                             ui.label(
-                                egui::RichText::new("已扫描文件")
+                                egui::RichText::new("ETW 事件")
                                     .font(FontId::proportional(13.0))
                                     .color(theme::text_secondary(dark_mode)),
                             );
@@ -917,7 +960,7 @@ impl ClamAvApp {
                                     .color(if count > 0 { theme::DANGER } else { theme::SUCCESS }),
                             );
                             ui.label(
-                                egui::RichText::new("发现威胁")
+                                egui::RichText::new("规则命中")
                                     .font(FontId::proportional(13.0))
                                     .color(theme::text_secondary(dark_mode)),
                             );
@@ -926,49 +969,26 @@ impl ClamAvApp {
             });
         });
 
-        // Threats
+        // Detections
         if !self.realtime.threats.is_empty() {
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new(format!("⚠ 实时检测到 {} 个威胁", self.realtime.threats.len()))
+                    egui::RichText::new(format!("⚠ 检测到 {} 个威胁", self.realtime.threats.len()))
                         .font(FontId::proportional(15.0))
                         .color(theme::DANGER),
                 );
                 ui.add_space(12.0);
-                if ui.add(theme::danger_button("🔒 全部隔离")).clicked() {
-                    let quarantine_dir = self.config.quarantine_dir.clone();
-                    let threats = self.realtime.threats.clone();
-                    let mut count = 0u32;
-                    let mut remaining = Vec::new();
-                    for t in &threats {
-                        let ti = crate::scanner::ThreatInfo {
-                            file_path: t.file_path.clone(),
-                            threat_name: t.threat_name.clone(),
-                        };
-                        if self.scan_engine.quarantine_threat(&ti, &quarantine_dir).is_ok() {
-                            count += 1;
-                        } else {
-                            remaining.push(t.clone());
-                        }
-                    }
-                    self.realtime.threats = remaining;
-                    if count > 0 {
-                        self.realtime.log_lines.push(format!(
-                            "INFO: 已隔离 {} 个实时检测到的威胁", count
-                        ));
-                    }
+                if ui.add(theme::danger_button("🗑 清除记录")).clicked() {
+                    self.realtime.threats.clear();
                 }
             });
             ui.add_space(4.0);
 
-            let threats = self.realtime.threats.clone();
-            let quarantine_dir = self.config.quarantine_dir.clone();
-            let mut quarantined_idx: Option<usize> = None;
             egui::ScrollArea::vertical()
                 .max_height(200.0)
                 .show(ui, |ui| {
-                    for (idx, threat) in threats.iter().rev().take(50).enumerate() {
+                    for threat in self.realtime.threats.iter().rev().take(50) {
                         egui::Frame::new()
                             .fill(theme::danger_surface(dark_mode))
                             .corner_radius(CornerRadius::same(6))
@@ -990,30 +1010,11 @@ impl ClamAvApp {
                                                 .color(theme::text_secondary(dark_mode)),
                                         );
                                     });
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.add(theme::danger_button("🔒 隔离")).clicked() {
-                                            let ti = crate::scanner::ThreatInfo {
-                                                file_path: threat.file_path.clone(),
-                                                threat_name: threat.threat_name.clone(),
-                                            };
-                                            if self.scan_engine.quarantine_threat(&ti, &quarantine_dir).is_ok() {
-                                                // rev().take(50) reverses order; convert back to original index
-                                                let real_idx = threats.len() - 1 - idx;
-                                                quarantined_idx = Some(real_idx);
-                                            }
-                                        }
-                                    });
                                 });
                             });
                         ui.add_space(2.0);
                     }
                 });
-            if let Some(idx) = quarantined_idx {
-                self.realtime.threats.remove(idx);
-                self.realtime.log_lines.push(
-                    "INFO: 已将感染文件移至隔离区".to_string()
-                );
-            }
         }
 
         // Activity log
@@ -1026,8 +1027,10 @@ impl ClamAvApp {
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
                     for line in self.realtime.log_lines.iter().rev().take(100) {
-                        let color = if line.contains("THREAT") {
+                        let color = if line.contains("DETECTED") {
                             theme::DANGER
+                        } else if line.contains("ERROR") {
+                            theme::WARNING
                         } else {
                             theme::text_secondary(dark_mode)
                         };
@@ -1445,7 +1448,7 @@ impl ClamAvApp {
             ui.checkbox(&mut self.config.auto_update, "启动时自动更新病毒库");
             ui.checkbox(
                 &mut self.config.persist_realtime_on_exit,
-                "退出 GUI 后保留实时保护进程",
+                "退出 GUI 后保留 YAMAGoya ETW 会话",
             );
 
             ui.add_space(16.0);

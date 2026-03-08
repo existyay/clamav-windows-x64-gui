@@ -22,9 +22,32 @@ pub struct AppConfig {
     pub persist_realtime_on_exit: bool,
     #[serde(default = "default_dark_mode")]
     pub dark_mode: bool,
+    /// YAMAGoya 目录（包含 YAMAGoya.exe）
+    #[serde(default)]
+    pub yamagoya_dir: PathBuf,
+    /// YAMAGoya 规则目录
+    #[serde(default)]
+    pub yamagoya_rules_dir: PathBuf,
+    /// 规则类型: "yaml", "sigma", "yara"
+    #[serde(default = "default_yamagoya_rule_type")]
+    pub yamagoya_rule_type: String,
+    /// 监控所有事件类别
+    #[serde(default = "default_true")]
+    pub yamagoya_monitor_all: bool,
+    /// 自动终止检测到的恶意进程
+    #[serde(default)]
+    pub yamagoya_kill_process: bool,
 }
 
 fn default_dark_mode() -> bool {
+    true
+}
+
+fn default_yamagoya_rule_type() -> String {
+    "sigma".to_string()
+}
+
+fn default_true() -> bool {
     true
 }
 
@@ -77,6 +100,11 @@ impl Default for AppConfig {
             auto_update: true,
             persist_realtime_on_exit: false,
             dark_mode: true,
+            yamagoya_dir: base.join("yamagoya"),
+            yamagoya_rules_dir: base.join("yamagoya").join("rules"),
+            yamagoya_rule_type: "sigma".to_string(),
+            yamagoya_monitor_all: true,
+            yamagoya_kill_process: false,
         }
     }
 }
@@ -150,6 +178,10 @@ impl AppConfig {
 
     pub fn freshclam_conf_path(&self) -> PathBuf {
         self.clamav_dir.join("freshclam.conf")
+    }
+
+    pub fn yamagoya_path(&self) -> PathBuf {
+        self.yamagoya_dir.join("YAMAGoya.exe")
     }
 
     pub fn scan_history_path(&self) -> PathBuf {

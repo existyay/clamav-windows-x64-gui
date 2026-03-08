@@ -51,6 +51,8 @@ pub struct ScanHistory {
     pub stats: ScanStats,
     pub log_lines: Vec<String>,
     pub scan_target: String,
+    #[serde(default)]
+    pub scan_target_paths: Vec<String>,
     pub last_scan_time: String,
     pub was_completed: bool,
 }
@@ -72,6 +74,8 @@ pub struct ScanEngine {
     pub current_file: String,
     pub scan_started_at: Option<std::time::Instant>,
     pub was_cancelled: bool,
+    /// 实际的扫描目标路径列表（用于继续扫描）
+    pub scan_target_paths: Vec<PathBuf>,
     stats_base: ScanStats,
     scan_child_id: Arc<Mutex<Option<u32>>>,
 }
@@ -88,6 +92,7 @@ impl Default for ScanEngine {
             current_file: String::new(),
             scan_started_at: None,
             was_cancelled: false,
+            scan_target_paths: Vec::new(),
             stats_base: ScanStats::default(),
             scan_child_id: Arc::new(Mutex::new(None)),
         }
@@ -119,14 +124,16 @@ impl ScanEngine {
         self.log_lines.clear();
         self.current_file.clear();
         self.scan_started_at = Some(std::time::Instant::now());
+        self.scan_target_paths = targets.clone();
 
         self.spawn_scan_thread(targets, config);
     }
 
-    /// 继续扫描：不清除已有的威胁列表和日志，累加统计数据
-    pub fn continue_scan(&mut self, target: PathBuf, config: &AppConfig) {
-        self.continue_scan_targets(vec![target], config);
-    }
+    /// 使用已存储的目标路径继续扫描
+    pub fn continue_scan_previous(&mut self, config: &AppConfig) {
+        let targets = self.scan_target_paths.clone();
+        self.continue_scan_targets(targets, config);
+}
 
     pub fn continue_scan_targets(&mut self, targets: Vec<PathBuf>, config: &AppConfig) {
         if self.state == ScanState::Scanning {
@@ -267,6 +274,9 @@ impl ScanEngine {
             stats: self.stats.clone(),
             log_lines: self.log_lines.clone(),
             scan_target: scan_target.to_string(),
+            scan_target_paths: self.scan_target_paths.iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect(),
             last_scan_time: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             was_completed: self.state == ScanState::Finished && !self.was_cancelled,
         };
@@ -287,6 +297,9 @@ impl ScanEngine {
         self.stats_base = history.stats;
         self.log_lines = history.log_lines;
         self.was_cancelled = !history.was_completed;
+        self.scan_target_paths = history.scan_target_paths.iter()
+            .map(|s| PathBuf::from(s))
+            .collect();
         self.state = ScanState::Finished;
         Some(history.scan_target)
     }
