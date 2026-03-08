@@ -56,11 +56,15 @@ impl ClamAvApp {
             scan_target = target;
         }
 
+        let mut realtime = RealtimeProtection::default();
+        // 尝试重新连接到上次退出时保留的后台 YAMAGoya 进程
+        realtime.try_reconnect(&config);
+
         Self {
             config,
             scan_engine,
             updater,
-            realtime: RealtimeProtection::default(),
+            realtime,
             current_tab: Tab::Dashboard,
             scan_target,
             theme_applied: false,
@@ -813,7 +817,7 @@ impl ClamAvApp {
         ui.horizontal(|ui| {
             if is_running {
                 if ui.add(theme::danger_button("⏹ 停止保护")).clicked() {
-                    self.realtime.stop();
+                    self.realtime.stop(&self.config);
                 }
             } else {
                 let yamagoya_exists = self.config.yamagoya_path().exists();
@@ -1528,7 +1532,7 @@ impl Drop for ClamAvApp {
         if !self.config.persist_realtime_on_exit
             && self.realtime.state == RealtimeState::Running
         {
-            self.realtime.stop();
+            self.realtime.stop(&self.config);
         }
         // ScanEngine::Drop will handle killing scan child process
     }

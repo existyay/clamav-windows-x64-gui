@@ -142,6 +142,10 @@ impl AppConfig {
         crate::embedded::extract_embedded_binaries(&self.clamav_dir);
         // 释放 ClamAV 证书（freshclam 签名验证需要）
         crate::embedded::extract_certs(&self.clamav_dir);
+        // 释放内嵌的 YAMAGoya 可执行文件和规则（如果有）
+        let _ = std::fs::create_dir_all(&self.yamagoya_dir);
+        let _ = std::fs::create_dir_all(&self.yamagoya_rules_dir);
+        crate::embedded::extract_yamagoya(&self.yamagoya_dir);
     }
 
     pub fn clamscan_path(&self) -> PathBuf {

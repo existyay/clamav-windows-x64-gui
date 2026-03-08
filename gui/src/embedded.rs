@@ -1,6 +1,9 @@
 // Auto-generated embed manifest is included from OUT_DIR
 include!(concat!(env!("OUT_DIR"), "/embed_manifest.rs"));
 
+// Auto-generated YAMAGoya embed manifest
+include!(concat!(env!("OUT_DIR"), "/yamagoya_manifest.rs"));
+
 /// 将内嵌的 ClamAV 文件释放到指定目录。
 /// 支持子目录（如 database/main.cvd → clamav_dir/database/main.cvd）。
 /// 仅释放目标目录中不存在的文件。
@@ -13,6 +16,27 @@ pub fn extract_embedded_binaries(clamav_dir: &std::path::Path) {
 
     for (rel_path, data) in EMBEDDED_FILES {
         let dest = clamav_dir.join(rel_path);
+        if !dest.exists() {
+            if let Some(parent) = dest.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&dest, data);
+        }
+    }
+}
+
+/// 将内嵌的 YAMAGoya 文件释放到指定目录。
+/// 支持子目录（如 rules/xxx.yml → yamagoya_dir/rules/xxx.yml）。
+/// 仅释放目标目录中不存在的文件。
+pub fn extract_yamagoya(yamagoya_dir: &std::path::Path) {
+    if YAMAGOYA_FILES.is_empty() {
+        return;
+    }
+
+    let _ = std::fs::create_dir_all(yamagoya_dir);
+
+    for (rel_path, data) in YAMAGOYA_FILES {
+        let dest = yamagoya_dir.join(rel_path);
         if !dest.exists() {
             if let Some(parent) = dest.parent() {
                 let _ = std::fs::create_dir_all(parent);
