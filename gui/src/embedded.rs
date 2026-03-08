@@ -4,7 +4,12 @@ include!(concat!(env!("OUT_DIR"), "/embed_manifest.rs"));
 // Auto-generated YAMAGoya embed manifest
 include!(concat!(env!("OUT_DIR"), "/yamagoya_manifest.rs"));
 
-/// 将内嵌的 ClamAV 文件释放到指定目录。
+/// 解压 zstd 压缩的数据
+fn decompress(compressed: &[u8]) -> Option<Vec<u8>> {
+    zstd::decode_all(compressed).ok()
+}
+
+/// 将内嵌的 ClamAV 文件释放到指定目录（zstd 解压）。
 /// 支持子目录（如 database/main.cvd → clamav_dir/database/main.cvd）。
 /// 仅释放目标目录中不存在的文件。
 pub fn extract_embedded_binaries(clamav_dir: &std::path::Path) {
@@ -14,18 +19,20 @@ pub fn extract_embedded_binaries(clamav_dir: &std::path::Path) {
 
     let _ = std::fs::create_dir_all(clamav_dir);
 
-    for (rel_path, data) in EMBEDDED_FILES {
+    for (rel_path, compressed_data) in EMBEDDED_FILES {
         let dest = clamav_dir.join(rel_path);
         if !dest.exists() {
             if let Some(parent) = dest.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(&dest, data);
+            if let Some(data) = decompress(compressed_data) {
+                let _ = std::fs::write(&dest, data);
+            }
         }
     }
 }
 
-/// 将内嵌的 YAMAGoya 文件释放到指定目录。
+/// 将内嵌的 YAMAGoya 文件释放到指定目录（zstd 解压）。
 /// 支持子目录（如 rules/xxx.yml → yamagoya_dir/rules/xxx.yml）。
 /// 仅释放目标目录中不存在的文件。
 pub fn extract_yamagoya(yamagoya_dir: &std::path::Path) {
@@ -35,13 +42,15 @@ pub fn extract_yamagoya(yamagoya_dir: &std::path::Path) {
 
     let _ = std::fs::create_dir_all(yamagoya_dir);
 
-    for (rel_path, data) in YAMAGOYA_FILES {
+    for (rel_path, compressed_data) in YAMAGOYA_FILES {
         let dest = yamagoya_dir.join(rel_path);
         if !dest.exists() {
             if let Some(parent) = dest.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(&dest, data);
+            if let Some(data) = decompress(compressed_data) {
+                let _ = std::fs::write(&dest, data);
+            }
         }
     }
 }
