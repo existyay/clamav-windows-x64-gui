@@ -1,5 +1,6 @@
 use eframe::egui;
 use egui::{Color32, CornerRadius, FontId, Stroke};
+use std::collections::HashSet;
 
 use crate::config::AppConfig;
 use crate::scanner::{ScanEngine, ScanState};
@@ -30,6 +31,9 @@ pub struct ClamAvApp {
     settings_max_size: String,
     settings_threads: String,
     settings_exclude: String,
+    // Quarantine state
+    quarantine_selected: HashSet<String>,
+    auto_quarantine_pending: bool,
 }
 
 impl ClamAvApp {
@@ -57,6 +61,8 @@ impl ClamAvApp {
             settings_max_size,
             settings_threads,
             settings_exclude,
+            quarantine_selected: HashSet::new(),
+            auto_quarantine_pending: false,
         }
     }
 
@@ -381,6 +387,7 @@ impl ClamAvApp {
             format!("快速扫描: {}", preview)
         };
 
+        self.auto_quarantine_pending = false;
         self.scan_engine.start_scan_targets(targets, &self.config);
     }
 
@@ -409,6 +416,7 @@ impl ClamAvApp {
                 .join(" ")
         );
 
+        self.auto_quarantine_pending = false;
         self.scan_engine.start_scan_targets(drives, &self.config);
     }
 
@@ -458,13 +466,26 @@ impl ClamAvApp {
 
             match self.scan_engine.state {
                 ScanState::Idle | ScanState::Finished => {
-                    let can_scan = !self.scan_target.is_empty()
-                        && std::path::Path::new(&self.scan_target).exists();
-                    if ui.add_enabled(can_scan, theme::accent_button("▶ 开始扫描")).clicked() {
-                        self.scan_engine.start_scan(
-                            std::path::PathBuf::from(&self.scan_target),
-                            &self.config,
-                        );
+                    let has_target = !self.scan_target.is_empty();
+                    if ui.add_enabled(has_target, theme::accent_button("▶ 开始扫描")).clicked() {
+                        let target_path = std::path::Path::new(&self.scan_target);
+                        if !target_path.exists() {
+                            self.scan_engine.log_lines.push(format!(
+                                "ERROR: 扫描目标不存在: {}", self.scan_target
+                            ));
+                            self.scan_engine.state = ScanState::Finished;
+                        } else if !self.config.clamscan_path().exists() {
+                            self.scan_engine.log_lines.push(format!(
+                                "ERROR: 扫描引擎未找到: {}", self.config.clamscan_path().display()
+                            ));
+                            self.scan_engine.state = ScanState::Finished;
+                        } else {
+                            self.auto_quarantine_pending = false;
+                            self.scan_engine.start_scan(
+                                std::path::PathBuf::from(&self.scan_target),
+                                &self.config,
+                            );
+                        }
                     }
                 }
                 ScanState::Scanning => {
@@ -571,8 +592,40 @@ impl ClamAvApp {
             ui.add_space(8.0);
         }
 
+        // Error messages display
+        if self.scan_engine.state != ScanState::Scanning {
+            let errors: Vec<_> = self.scan_engine.log_lines.iter()
+                .filter(|l| l.starts_with("ERROR:"))
+                .cloned()
+                .collect();
+            if !errors.is_empty() {
+                for err in errors.iter().rev().take(3) {
+                    egui::Frame::new()
+                        .fill(theme::danger_surface(dark_mode))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("❌")
+                                        .font(FontId::proportional(16.0)),
+                                );
+                                ui.label(
+                                    egui::RichText::new(err)
+                                        .font(FontId::proportional(13.0))
+                                        .color(theme::DANGER),
+                                );
+                            });
+                        });
+                    ui.add_space(4.0);
+                }
+            }
+        }
+
         // Scan result banner
-        if self.scan_engine.state == ScanState::Finished {
+        if self.scan_engine.state == ScanState::Finished
+            && self.scan_engine.stats.scanned_files > 0
+        {
             let (msg, color) = if self.scan_engine.stats.infected_files == 0 {
                 ("✅ 扫描完成 - 未发现威胁", theme::SUCCESS)
             } else {
@@ -964,68 +1017,214 @@ impl ClamAvApp {
 
         ui.add_space(8.0);
 
-        if ui.add(theme::accent_button("📁 打开隔离目录")).clicked() {
-            let _ = open::that(&self.config.quarantine_dir);
-        }
+        // 列出隔离文件
+        let entries = crate::scanner::list_quarantine_entries(&self.config.quarantine_dir);
+
+        // 清除无效选择（已不在列表中的）
+        let valid_keys: HashSet<String> = entries
+            .iter()
+            .map(|e| e.quarantine_path.to_string_lossy().to_string())
+            .collect();
+        self.quarantine_selected.retain(|k| valid_keys.contains(k));
+
+        // 工具栏
+        ui.horizontal(|ui| {
+            if ui.add(theme::accent_button("📁 打开隔离目录")).clicked() {
+                let _ = open::that(&self.config.quarantine_dir);
+            }
+
+            if !entries.is_empty() {
+                ui.add_space(8.0);
+                // 全选 / 取消全选
+                if self.quarantine_selected.len() == entries.len() {
+                    if ui.add(theme::accent_button("☐ 取消全选")).clicked() {
+                        self.quarantine_selected.clear();
+                    }
+                } else {
+                    if ui.add(theme::accent_button("☑ 全选")).clicked() {
+                        self.quarantine_selected = valid_keys;
+                    }
+                }
+
+                let sel_count = self.quarantine_selected.len();
+                if sel_count > 0 {
+                    ui.add_space(8.0);
+                    if ui
+                        .add(theme::danger_button(&format!("🗑 批量删除 ({})", sel_count)))
+                        .clicked()
+                    {
+                        let to_delete: Vec<_> = entries
+                            .iter()
+                            .filter(|e| {
+                                self.quarantine_selected
+                                    .contains(&e.quarantine_path.to_string_lossy().to_string())
+                            })
+                            .cloned()
+                            .collect();
+                        for entry in &to_delete {
+                            let _ = crate::scanner::delete_quarantined(entry);
+                        }
+                        self.quarantine_selected.clear();
+                    }
+                    if ui
+                        .add(theme::accent_button(&format!("↩ 批量恢复 ({})", sel_count)))
+                        .clicked()
+                    {
+                        let to_restore: Vec<_> = entries
+                            .iter()
+                            .filter(|e| {
+                                self.quarantine_selected
+                                    .contains(&e.quarantine_path.to_string_lossy().to_string())
+                            })
+                            .cloned()
+                            .collect();
+                        for entry in &to_restore {
+                            let _ = crate::scanner::restore_quarantined(entry);
+                        }
+                        self.quarantine_selected.clear();
+                    }
+                }
+            }
+        });
 
         ui.add_space(12.0);
 
-        // List quarantined files
-        let entries: Vec<_> = std::fs::read_dir(&self.config.quarantine_dir)
-            .ok()
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path()
-                            .extension()
-                            .map(|ext| ext == "quarantine")
-                            .unwrap_or(false)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
         if entries.is_empty() {
-            ui.label(
-                egui::RichText::new("  隔离区为空 ✓")
-                    .font(FontId::proportional(14.0))
-                    .color(theme::SUCCESS),
-            );
+            egui::Frame::new()
+                .fill(theme::success_surface(dark_mode))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(egui::Margin::same(16))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("✅")
+                                .font(FontId::proportional(24.0)),
+                        );
+                        ui.label(
+                            egui::RichText::new("隔离区为空 - 没有隔离的文件")
+                                .font(FontId::proportional(15.0))
+                                .color(theme::SUCCESS),
+                        );
+                    });
+                });
         } else {
             ui.label(
-                egui::RichText::new(format!("共 {} 个隔离文件", entries.len()))
-                    .font(FontId::proportional(13.0))
-                    .color(theme::WARNING),
+                egui::RichText::new(format!(
+                    "共 {} 个隔离文件 (已选 {})",
+                    entries.len(),
+                    self.quarantine_selected.len()
+                ))
+                .font(FontId::proportional(13.0))
+                .color(theme::WARNING),
             );
+            ui.add_space(4.0);
 
             egui::ScrollArea::vertical()
-                .max_height(400.0)
+                .max_height(450.0)
                 .show(ui, |ui| {
                     for entry in &entries {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        let size = entry
-                            .metadata()
-                            .map(|m| format_size(m.len()))
+                        let key = entry.quarantine_path.to_string_lossy().to_string();
+                        let name = entry
+                            .quarantine_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default();
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("🔒").color(theme::WARNING),
-                            );
-                            ui.label(
-                                egui::RichText::new(&name)
-                                    .font(FontId::proportional(13.0))
-                                    .color(theme::text_primary(dark_mode)),
-                            );
-                            ui.label(
-                                egui::RichText::new(size)
-                                    .font(FontId::proportional(12.0))
-                                    .color(theme::text_secondary(dark_mode)),
-                            );
-                            if ui.add(theme::danger_button("🗑 删除")).clicked() {
-                                let _ = std::fs::remove_file(entry.path());
-                            }
-                        });
-                        ui.separator();
+                        let size_str = format_size(entry.file_size);
+
+                        egui::Frame::new()
+                            .fill(theme::bg_card(dark_mode))
+                            .corner_radius(CornerRadius::same(6))
+                            .inner_margin(egui::Margin::same(8))
+                            .stroke(Stroke::new(
+                                1.0,
+                                if self.quarantine_selected.contains(&key) {
+                                    theme::ACCENT
+                                } else {
+                                    theme::border_color(dark_mode)
+                                },
+                            ))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    // 选择框
+                                    let mut checked = self.quarantine_selected.contains(&key);
+                                    if ui.checkbox(&mut checked, "").changed() {
+                                        if checked {
+                                            self.quarantine_selected.insert(key.clone());
+                                        } else {
+                                            self.quarantine_selected.remove(&key);
+                                        }
+                                    }
+
+                                    ui.label(
+                                        egui::RichText::new("🔒")
+                                            .font(FontId::proportional(16.0))
+                                            .color(theme::WARNING),
+                                    );
+
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(&name)
+                                                .font(FontId::proportional(13.0))
+                                                .color(theme::text_primary(dark_mode)),
+                                        );
+                                        // 显示元数据信息
+                                        if let Some(ref meta) = entry.meta {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "威胁: {}",
+                                                    meta.threat_name
+                                                ))
+                                                .font(FontId::proportional(11.0))
+                                                .color(theme::DANGER),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "原路径: {}",
+                                                    truncate_path(&meta.original_path, 70)
+                                                ))
+                                                .font(FontId::proportional(11.0))
+                                                .color(theme::text_secondary(dark_mode)),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "隔离时间: {} | 大小: {}",
+                                                    meta.quarantine_date, size_str
+                                                ))
+                                                .font(FontId::proportional(11.0))
+                                                .color(theme::text_secondary(dark_mode)),
+                                            );
+                                        } else {
+                                            ui.label(
+                                                egui::RichText::new(format!("大小: {}", size_str))
+                                                    .font(FontId::proportional(11.0))
+                                                    .color(theme::text_secondary(dark_mode)),
+                                            );
+                                        }
+                                    });
+
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.add(theme::danger_button("🗑 删除")).clicked() {
+                                                let _ = crate::scanner::delete_quarantined(entry);
+                                                self.quarantine_selected.remove(&key);
+                                            }
+                                            let has_meta = entry.meta.is_some();
+                                            if ui
+                                                .add_enabled(
+                                                    has_meta,
+                                                    theme::accent_button("↩ 恢复"),
+                                                )
+                                                .clicked()
+                                            {
+                                                let _ = crate::scanner::restore_quarantined(entry);
+                                                self.quarantine_selected.remove(&key);
+                                            }
+                                        },
+                                    );
+                                });
+                            });
+                        ui.add_space(4.0);
                     }
                 });
         }
@@ -1207,6 +1406,28 @@ impl eframe::App for ClamAvApp {
         self.scan_engine.poll_messages();
         self.updater.poll_messages();
         self.realtime.poll_messages();
+
+        // 扫描完成后自动隔离感染文件
+        if self.scan_engine.state == ScanState::Finished
+            && !self.auto_quarantine_pending
+            && !self.scan_engine.threats.is_empty()
+        {
+            self.auto_quarantine_pending = true;
+            let quarantine_dir = self.config.quarantine_dir.clone();
+            let threats = self.scan_engine.threats.clone();
+            let mut quarantined_count = 0u32;
+            for threat in &threats {
+                if let Ok(_) = self.scan_engine.quarantine_threat(threat, &quarantine_dir) {
+                    quarantined_count += 1;
+                }
+            }
+            if quarantined_count > 0 {
+                self.scan_engine.log_lines.push(format!(
+                    "INFO: 已自动隔离 {} 个感染文件到隔离区",
+                    quarantined_count
+                ));
+            }
+        }
 
         // Request repaint while scanning/updating/realtime
         if self.scan_engine.state == ScanState::Scanning

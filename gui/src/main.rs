@@ -6,6 +6,7 @@ mod realtime;
 mod app;
 mod theme;
 mod config;
+mod embedded;
 
 use eframe::egui;
 

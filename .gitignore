@@ -246,3 +246,7 @@ dist/
 vcpkg_installed/
 gui/target/
 gui/fonts/
+
+# Embedded ClamAV binaries (user-supplied, not tracked)
+gui/embed/clamav/*
+!gui/embed/clamav/README.md

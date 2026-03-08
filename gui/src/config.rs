@@ -110,6 +110,8 @@ impl AppConfig {
         let _ = std::fs::create_dir_all(&self.database_dir);
         let _ = std::fs::create_dir_all(&self.quarantine_dir);
         let _ = std::fs::create_dir_all(&self.log_dir);
+        // 释放内嵌的 ClamAV 二进制文件（如果有）
+        crate::embedded::extract_embedded_binaries(&self.clamav_dir);
     }
 
     pub fn clamscan_path(&self) -> PathBuf {

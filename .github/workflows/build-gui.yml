@@ -185,6 +185,33 @@ jobs:
           }
         shell: pwsh
 
+      - name: Embed ClamAV binaries into GUI
+        run: |
+          $clamavInstall = "build\install"
+          $embedDir = "gui\embed\clamav"
+
+          New-Item -ItemType Directory -Path $embedDir -Force | Out-Null
+
+          # Copy executables
+          $exes = @("clamscan.exe","freshclam.exe","clamd.exe","clamdscan.exe")
+          foreach ($exe in $exes) {
+            $src = "$clamavInstall\$exe"
+            if (Test-Path $src) {
+              Copy-Item $src "$embedDir\$exe"
+              Write-Host "Embedded: $exe"
+            }
+          }
+
+          # Copy DLLs
+          Get-ChildItem "$clamavInstall\*.dll" | ForEach-Object {
+            Copy-Item $_.FullName "$embedDir\$($_.Name)"
+            Write-Host "Embedded: $($_.Name)"
+          }
+
+          Write-Host "Embedded files:"
+          Get-ChildItem $embedDir | Format-Table Name, Length -AutoSize
+        shell: pwsh
+
       - name: Build GUI
         run: |
           cd gui
@@ -271,17 +298,28 @@ jobs:
             Copy-Item "$clamavInstall\COPYING" "$outputDir\COPYING" -Recurse
           }
 
-          # Create ZIP
+          # Create ZIP (portable distribution with separate files)
           Compress-Archive -Path "$outputDir\*" -DestinationPath "dist\ClamAV-GUI-Portable-x64.zip" -CompressionLevel Optimal
 
-          $size = [math]::Round((Get-Item "dist\ClamAV-GUI-Portable-x64.zip").Length / 1MB, 1)
-          Write-Host "Package created: $size MB"
+          # Copy standalone exe (all-in-one with embedded binaries)
+          Copy-Item $guiExe "dist\ClamAV-Scanner-Standalone-x64.exe"
 
-      - name: Upload artifact
+          $zipSize = [math]::Round((Get-Item "dist\ClamAV-GUI-Portable-x64.zip").Length / 1MB, 1)
+          $exeSize = [math]::Round((Get-Item "dist\ClamAV-Scanner-Standalone-x64.exe").Length / 1MB, 1)
+          Write-Host "Portable package: $zipSize MB"
+          Write-Host "Standalone exe:   $exeSize MB"
+
+      - name: Upload portable artifact
         uses: actions/upload-artifact@v4
         with:
           name: ClamAV-GUI-Portable-x64-${{ steps.version.outputs.version }}
           path: dist/ClamAV-GUI-Portable-x64.zip
+
+      - name: Upload standalone artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClamAV-Scanner-Standalone-x64-${{ steps.version.outputs.version }}
+          path: dist/ClamAV-Scanner-Standalone-x64.exe
 
       - name: Commit version bump
         if: github.event_name != 'pull_request'
@@ -311,7 +349,9 @@ jobs:
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ClamAV GUI ${{ steps.version.outputs.version }}
-          files: dist/ClamAV-GUI-Portable-x64.zip
+          files: |
+            dist/ClamAV-GUI-Portable-x64.zip
+            dist/ClamAV-Scanner-Standalone-x64.exe
           generate_release_notes: true
           draft: false
           prerelease: false
@@ -319,15 +359,16 @@ jobs:
             ## ClamAV Windows x64 GUI - v${{ steps.version.outputs.version }}
 
             ### 📦 下载
-            - **便携版**: ClamAV-GUI-Portable-x64.zip
+            - **便携版**: ClamAV-GUI-Portable-x64.zip（解压即用）
+            - **单文件版**: ClamAV-Scanner-Standalone-x64.exe（内嵌全部依赖，首次启动自动释放）
 
             ### ✨ 功能特性
             - 🎨 现代化深色/浅色主题切换
             - ⚡ 快速扫描系统关键位置
             - 💿 全盘扫描功能
-            - 🛡️ 实时保护（可选常驻）
+            - 🛡️ 实时保护（基于系统文件监控 API，即时检测）
             - 🔄 病毒库在线更新
-            - 🔒 威胁隔离管理
+            - 🔒 威胁自动隔离 + 批量删除/恢复管理
             - 📊 美化的仪表盘和统计可视化
             - ⚙️ 灵活的扫描配置选项
 

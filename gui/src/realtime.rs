@@ -7,6 +7,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use notify::Watcher;
+
 #[derive(Clone, Debug)]
 pub enum RealtimeMessage {
     ThreatFound {
@@ -154,7 +156,7 @@ fn default_watch_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// Polling-based real-time protection: periodically scans new/modified files
+/// 基于 notify (Windows: ReadDirectoryChangesW) 的实时文件系统监控
 fn realtime_watch_loop(
     clamscan: PathBuf,
     db_dir: PathBuf,
@@ -164,134 +166,173 @@ fn realtime_watch_loop(
 ) {
     if !clamscan.exists() {
         let _ = tx.send(RealtimeMessage::Error(format!(
-            "clamscan not found: {}",
+            "扫描器未找到: {}",
             clamscan.display()
         )));
         let _ = tx.send(RealtimeMessage::Stopped);
         return;
     }
 
-    let mut known_files: HashSet<PathBuf> = HashSet::new();
-    let scan_interval = Duration::from_secs(5);
+    // 创建文件系统事件通道
+    let (event_tx, event_rx) = mpsc::channel::<notify::Result<notify::Event>>();
+    let mut watcher = match notify::RecommendedWatcher::new(
+        move |res| {
+            let _ = event_tx.send(res);
+        },
+        notify::Config::default(),
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            let _ = tx.send(RealtimeMessage::Error(format!(
+                "无法创建文件系统监控器: {}",
+                e
+            )));
+            let _ = tx.send(RealtimeMessage::Stopped);
+            return;
+        }
+    };
+
+    // 注册监控目录
+    for dir in &watch_dirs {
+        match watcher.watch(dir, notify::RecursiveMode::Recursive) {
+            Ok(_) => {
+                let _ = tx.send(RealtimeMessage::FileScanned(format!(
+                    "开始监控: {}",
+                    dir.display()
+                )));
+            }
+            Err(e) => {
+                let _ = tx.send(RealtimeMessage::Error(format!(
+                    "无法监控目录 {}: {}",
+                    dir.display(),
+                    e
+                )));
+            }
+        }
+    }
+
+    let mut pending_files: HashSet<PathBuf> = HashSet::new();
+    let mut last_scan = Instant::now();
+    let debounce = Duration::from_secs(2);
 
     loop {
-        if let Ok(flag) = cancel.lock() {
-            if *flag {
+        // 检查取消标志
+        if cancel.lock().map(|f| *f).unwrap_or(false) {
+            let _ = tx.send(RealtimeMessage::Stopped);
+            return;
+        }
+
+        // 接收文件系统事件（超时500ms）
+        match event_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(Ok(event)) => {
+                match event.kind {
+                    notify::EventKind::Create(_) | notify::EventKind::Modify(_) => {
+                        for path in event.paths {
+                            if path.is_file()
+                                && !path.to_string_lossy().ends_with(".quarantine")
+                                && !path.to_string_lossy().ends_with(".meta")
+                            {
+                                pending_files.insert(path);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(RealtimeMessage::Error(format!(
+                    "监控错误: {}",
+                    e
+                )));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // 正常超时，继续循环
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = tx.send(RealtimeMessage::Error(
+                    "文件监控通道断开".to_string(),
+                ));
                 let _ = tx.send(RealtimeMessage::Stopped);
                 return;
             }
         }
 
-        let cycle_start = Instant::now();
-        let mut new_files: Vec<PathBuf> = Vec::new();
+        // 去抖动: 积累文件后批量扫描
+        if !pending_files.is_empty() && last_scan.elapsed() >= debounce {
+            let files: Vec<PathBuf> = pending_files.drain().collect();
 
-        for dir in &watch_dirs {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let path = entry.path();
-                    if path.is_file() {
-                        if !known_files.contains(&path) {
-                            // Check if modified recently (last 30s) or never seen
-                            let is_recent = entry
-                                .metadata()
-                                .ok()
-                                .and_then(|m| m.modified().ok())
-                                .and_then(|t| t.elapsed().ok())
-                                .map(|elapsed| elapsed < Duration::from_secs(30))
-                                .unwrap_or(false); // If we can't get time, assume not recent
+            for chunk in files.chunks(20) {
+                if cancel.lock().map(|f| *f).unwrap_or(false) {
+                    let _ = tx.send(RealtimeMessage::Stopped);
+                    return;
+                }
+                scan_batch(&clamscan, &db_dir, chunk, &tx);
+            }
 
-                            if is_recent || !known_files.contains(&path) {
-                                new_files.push(path.clone());
-                            }
-                            known_files.insert(path);
+            last_scan = Instant::now();
+        }
+    }
+}
+
+/// 批量扫描文件
+fn scan_batch(
+    clamscan: &PathBuf,
+    db_dir: &PathBuf,
+    files: &[PathBuf],
+    tx: &mpsc::Sender<RealtimeMessage>,
+) {
+    let mut cmd = Command::new(clamscan);
+    cmd.arg("--stdout").arg("--no-summary");
+
+    if db_dir.exists() {
+        cmd.arg(format!("--database={}", db_dir.display()));
+    }
+
+    for file in files {
+        cmd.arg(file);
+    }
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    match cmd.spawn() {
+        Ok(mut child) => {
+            if let Some(stdout) = child.stdout.take() {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().filter_map(|l| l.ok()) {
+                    if line.contains("FOUND") {
+                        let parts: Vec<&str> = line.splitn(2, ':').collect();
+                        if parts.len() == 2 {
+                            let file_path = parts[0].trim().to_string();
+                            let threat_name = parts[1]
+                                .trim()
+                                .trim_end_matches("FOUND")
+                                .trim()
+                                .to_string();
+                            let _ = tx.send(RealtimeMessage::ThreatFound {
+                                file_path,
+                                threat_name,
+                            });
                         }
+                    } else if line.contains(": OK") {
+                        let path =
+                            line.split(':').next().unwrap_or("").trim().to_string();
+                        let _ = tx.send(RealtimeMessage::FileScanned(path));
                     }
                 }
             }
+            let _ = child.wait();
         }
-
-        // Scan new files in batches
-        if !new_files.is_empty() {
-            for chunk in new_files.chunks(20) {
-                if let Ok(flag) = cancel.lock() {
-                    if *flag {
-                        let _ = tx.send(RealtimeMessage::Stopped);
-                        return;
-                    }
-                }
-
-                let mut cmd = Command::new(&clamscan);
-                cmd.arg("--stdout").arg("--no-summary");
-
-                if db_dir.exists() {
-                    cmd.arg(format!("--database={}", db_dir.display()));
-                }
-
-                for file in chunk {
-                    cmd.arg(file);
-                }
-
-                cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-                #[cfg(target_os = "windows")]
-                {
-                    use std::os::windows::process::CommandExt;
-                    cmd.creation_flags(0x08000000);
-                }
-
-                match cmd.spawn() {
-                    Ok(mut child) => {
-                        if let Some(stdout) = child.stdout.take() {
-                            let reader = BufReader::new(stdout);
-                            for line in reader.lines().filter_map(|l| l.ok()) {
-                                if line.contains("FOUND") {
-                                    let parts: Vec<&str> =
-                                        line.splitn(2, ':').collect();
-                                    if parts.len() == 2 {
-                                        let file_path =
-                                            parts[0].trim().to_string();
-                                        let threat_name = parts[1]
-                                            .trim()
-                                            .trim_end_matches("FOUND")
-                                            .trim()
-                                            .to_string();
-                                        let _ = tx.send(
-                                            RealtimeMessage::ThreatFound {
-                                                file_path,
-                                                threat_name,
-                                            },
-                                        );
-                                    }
-                                } else if line.contains(": OK") {
-                                    let path = line
-                                        .split(':')
-                                        .next()
-                                        .unwrap_or("")
-                                        .trim()
-                                        .to_string();
-                                    let _ = tx.send(
-                                        RealtimeMessage::FileScanned(path),
-                                    );
-                                }
-                            }
-                        }
-                        // Wait for process to fully exit and release handles
-                        let _ = child.wait();
-                    }
-                    Err(e) => {
-                        let _ = tx.send(RealtimeMessage::Error(format!(
-                            "Scan error: {}",
-                            e
-                        )));
-                    }
-                }
-            }
-        }
-
-        // Sleep until next cycle
-        let elapsed = cycle_start.elapsed();
-        if elapsed < scan_interval {
-            std::thread::sleep(scan_interval - elapsed);
+        Err(e) => {
+            let _ = tx.send(RealtimeMessage::Error(format!(
+                "扫描出错: {}",
+                e
+            )));
         }
     }
 }

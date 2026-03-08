@@ -5,6 +5,22 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+/// 隔离文件的元数据，保存在 .meta JSON 文件中
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct QuarantineMeta {
+    pub original_path: String,
+    pub threat_name: String,
+    pub quarantine_date: String,
+}
+
+/// 隔离区中的条目，包含文件路径和元数据
+#[derive(Clone, Debug)]
+pub struct QuarantineEntry {
+    pub quarantine_path: PathBuf,
+    pub file_size: u64,
+    pub meta: Option<QuarantineMeta>,
+}
+
 #[derive(Clone, Debug)]
 pub enum ScanMessage {
     Progress(String),
@@ -183,7 +199,7 @@ impl ScanEngine {
         &self,
         threat: &ThreatInfo,
         quarantine_dir: &std::path::Path,
-    ) -> Result<(), String> {
+    ) -> Result<PathBuf, String> {
         let src = PathBuf::from(&threat.file_path);
         if !src.exists() {
             return Err("File not found".into());
@@ -196,8 +212,83 @@ impl ScanEngine {
         let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
         let dest = quarantine_dir.join(format!("{}.{}.quarantine", name, ts));
         std::fs::rename(&src, &dest).map_err(|e| e.to_string())?;
-        Ok(())
+
+        // 保存元数据
+        let meta = QuarantineMeta {
+            original_path: threat.file_path.clone(),
+            threat_name: threat.threat_name.clone(),
+            quarantine_date: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        };
+        let meta_path = PathBuf::from(format!("{}.meta", dest.display()));
+        if let Ok(json) = serde_json::to_string_pretty(&meta) {
+            let _ = std::fs::write(&meta_path, json);
+        }
+
+        Ok(dest)
     }
+}
+
+/// 列出隔离区中的所有条目
+pub fn list_quarantine_entries(quarantine_dir: &std::path::Path) -> Vec<QuarantineEntry> {
+    let entries: Vec<_> = std::fs::read_dir(quarantine_dir)
+        .ok()
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .map(|ext| ext == "quarantine")
+                        .unwrap_or(false)
+                })
+                .map(|e| {
+                    let path = e.path();
+                    let file_size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                    let meta_path = PathBuf::from(format!("{}.meta", path.display()));
+                    let meta = std::fs::read_to_string(&meta_path)
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<QuarantineMeta>(&s).ok());
+                    QuarantineEntry {
+                        quarantine_path: path,
+                        file_size,
+                        meta,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    entries
+}
+
+/// 恢复隔离文件到原始路径
+pub fn restore_quarantined(entry: &QuarantineEntry) -> Result<(), String> {
+    let original = entry
+        .meta
+        .as_ref()
+        .map(|m| PathBuf::from(&m.original_path))
+        .ok_or_else(|| "无法找到原始路径信息".to_string())?;
+
+    // 如果原始目录不存在则创建
+    if let Some(parent) = original.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    std::fs::rename(&entry.quarantine_path, &original)
+        .map_err(|e| format!("恢复失败: {}", e))?;
+
+    // 删除元数据文件
+    let meta_path = PathBuf::from(format!("{}.meta", entry.quarantine_path.display()));
+    let _ = std::fs::remove_file(&meta_path);
+
+    Ok(())
+}
+
+/// 删除隔离文件及其元数据
+pub fn delete_quarantined(entry: &QuarantineEntry) -> Result<(), String> {
+    std::fs::remove_file(&entry.quarantine_path)
+        .map_err(|e| format!("删除失败: {}", e))?;
+    let meta_path = PathBuf::from(format!("{}.meta", entry.quarantine_path.display()));
+    let _ = std::fs::remove_file(&meta_path);
+    Ok(())
 }
 
 impl Drop for ScanEngine {
