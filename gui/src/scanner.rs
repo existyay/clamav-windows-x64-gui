@@ -130,8 +130,15 @@ impl ScanEngine {
                 kill_process_tree(id);
             }
         }
-        self.state = ScanState::Idle;
+        // 断开 receiver，丢弃扫描线程后续发送的消息
+        self.receiver = None;
+        // 更新最终用时
+        if let Some(started) = self.scan_started_at {
+            self.stats.elapsed_secs = started.elapsed().as_secs_f64();
+        }
+        self.state = ScanState::Finished;
         self.scan_started_at = None;
+        self.current_file.clear();
     }
 
     pub fn poll_messages(&mut self) {
