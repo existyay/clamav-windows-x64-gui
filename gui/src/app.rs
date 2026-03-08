@@ -48,7 +48,13 @@ impl ClamAvApp {
         let mut updater = DatabaseUpdater::default();
         updater.check_database_status(&config);
 
-        let scan_engine = ScanEngine::default();
+        let mut scan_engine = ScanEngine::default();
+        let mut scan_target = String::new();
+
+        // 加载上次扫描历史
+        if let Some(target) = scan_engine.load_history(&config.scan_history_path()) {
+            scan_target = target;
+        }
 
         Self {
             config,
@@ -56,7 +62,7 @@ impl ClamAvApp {
             updater,
             realtime: RealtimeProtection::default(),
             current_tab: Tab::Dashboard,
-            scan_target: String::new(),
+            scan_target,
             theme_applied: false,
             settings_max_size,
             settings_threads,
@@ -505,6 +511,19 @@ impl ClamAvApp {
                             );
                         }
                     }
+                    // 扫描被取消时显示“继续扫描”按钮
+                    if self.scan_engine.was_cancelled && has_target {
+                        if ui.add(theme::accent_button("▶ 继续扫描")).clicked() {
+                            let target_path = std::path::Path::new(&self.scan_target);
+                            if target_path.exists() && self.config.clamscan_path().exists() {
+                                self.auto_quarantine_pending = false;
+                                self.scan_engine.continue_scan(
+                                    std::path::PathBuf::from(&self.scan_target),
+                                    &self.config,
+                                );
+                            }
+                        }
+                    }
                 }
                 ScanState::Scanning => {
                     if ui.add(theme::danger_button("⏹ 停止扫描")).clicked() {
@@ -659,16 +678,43 @@ impl ClamAvApp {
 
         // Threats list
         if !self.scan_engine.threats.is_empty() {
-            ui.label(
-                egui::RichText::new(format!("⚠ 发现 {} 个威胁", self.scan_engine.threats.len()))
-                    .font(FontId::proportional(16.0))
-                    .color(theme::DANGER),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("⚠ 发现 {} 个威胁", self.scan_engine.threats.len()))
+                        .font(FontId::proportional(16.0))
+                        .color(theme::DANGER),
+                );
+                ui.add_space(12.0);
+                if ui.add(theme::danger_button("🔒 全部隔离")).clicked() {
+                    let quarantine_dir = self.config.quarantine_dir.clone();
+                    let threats = self.scan_engine.threats.clone();
+                    let mut count = 0u32;
+                    let mut remaining = Vec::new();
+                    for threat in &threats {
+                        match self.scan_engine.quarantine_threat(threat, &quarantine_dir) {
+                            Ok(_) => { count += 1; }
+                            Err(e) => {
+                                self.scan_engine.log_lines.push(format!(
+                                    "ERROR: 隔离失败 {}: {}", threat.file_path, e
+                                ));
+                                remaining.push(threat.clone());
+                            }
+                        }
+                    }
+                    self.scan_engine.threats = remaining;
+                    if count > 0 {
+                        self.scan_engine.log_lines.push(format!(
+                            "INFO: 已手动隔离 {} 个感染文件到隔离区", count
+                        ));
+                    }
+                }
+            });
             ui.add_space(4.0);
 
             let threats = self.scan_engine.threats.clone();
             let quarantine_dir = self.config.quarantine_dir.clone();
-            for threat in &threats {
+            let mut quarantined_idx: Option<usize> = None;
+            for (idx, threat) in threats.iter().enumerate() {
                 egui::Frame::new()
                     .fill(theme::danger_surface(dark_mode))
                     .corner_radius(CornerRadius::same(6))
@@ -694,12 +740,28 @@ impl ClamAvApp {
                             });
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.add(theme::danger_button("🔒 隔离")).clicked() {
-                                    let _ = self.scan_engine.quarantine_threat(threat, &quarantine_dir);
+                                    match self.scan_engine.quarantine_threat(threat, &quarantine_dir) {
+                                        Ok(_) => {
+                                            quarantined_idx = Some(idx);
+                                        }
+                                        Err(e) => {
+                                            self.scan_engine.log_lines.push(format!(
+                                                "ERROR: 隔离失败 {}: {}", threat.file_path, e
+                                            ));
+                                        }
+                                    }
                                 }
                             });
                         });
                     });
                 ui.add_space(4.0);
+            }
+            // 移除已成功隔离的单个威胁
+            if let Some(idx) = quarantined_idx {
+                self.scan_engine.threats.remove(idx);
+                self.scan_engine.log_lines.push(
+                    "INFO: 已将感染文件移至隔离区".to_string()
+                );
             }
         }
     }
@@ -867,17 +929,46 @@ impl ClamAvApp {
         // Threats
         if !self.realtime.threats.is_empty() {
             ui.add_space(12.0);
-            ui.label(
-                egui::RichText::new(format!("⚠ 实时检测到 {} 个威胁", self.realtime.threats.len()))
-                    .font(FontId::proportional(15.0))
-                    .color(theme::DANGER),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("⚠ 实时检测到 {} 个威胁", self.realtime.threats.len()))
+                        .font(FontId::proportional(15.0))
+                        .color(theme::DANGER),
+                );
+                ui.add_space(12.0);
+                if ui.add(theme::danger_button("🔒 全部隔离")).clicked() {
+                    let quarantine_dir = self.config.quarantine_dir.clone();
+                    let threats = self.realtime.threats.clone();
+                    let mut count = 0u32;
+                    let mut remaining = Vec::new();
+                    for t in &threats {
+                        let ti = crate::scanner::ThreatInfo {
+                            file_path: t.file_path.clone(),
+                            threat_name: t.threat_name.clone(),
+                        };
+                        if self.scan_engine.quarantine_threat(&ti, &quarantine_dir).is_ok() {
+                            count += 1;
+                        } else {
+                            remaining.push(t.clone());
+                        }
+                    }
+                    self.realtime.threats = remaining;
+                    if count > 0 {
+                        self.realtime.log_lines.push(format!(
+                            "INFO: 已隔离 {} 个实时检测到的威胁", count
+                        ));
+                    }
+                }
+            });
             ui.add_space(4.0);
 
+            let threats = self.realtime.threats.clone();
+            let quarantine_dir = self.config.quarantine_dir.clone();
+            let mut quarantined_idx: Option<usize> = None;
             egui::ScrollArea::vertical()
                 .max_height(200.0)
                 .show(ui, |ui| {
-                    for threat in self.realtime.threats.iter().rev().take(50) {
+                    for (idx, threat) in threats.iter().rev().take(50).enumerate() {
                         egui::Frame::new()
                             .fill(theme::danger_surface(dark_mode))
                             .corner_radius(CornerRadius::same(6))
@@ -899,11 +990,30 @@ impl ClamAvApp {
                                                 .color(theme::text_secondary(dark_mode)),
                                         );
                                     });
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.add(theme::danger_button("🔒 隔离")).clicked() {
+                                            let ti = crate::scanner::ThreatInfo {
+                                                file_path: threat.file_path.clone(),
+                                                threat_name: threat.threat_name.clone(),
+                                            };
+                                            if self.scan_engine.quarantine_threat(&ti, &quarantine_dir).is_ok() {
+                                                // rev().take(50) reverses order; convert back to original index
+                                                let real_idx = threats.len() - 1 - idx;
+                                                quarantined_idx = Some(real_idx);
+                                            }
+                                        }
+                                    });
                                 });
                             });
                         ui.add_space(2.0);
                     }
                 });
+            if let Some(idx) = quarantined_idx {
+                self.realtime.threats.remove(idx);
+                self.realtime.log_lines.push(
+                    "INFO: 已将感染文件移至隔离区".to_string()
+                );
+            }
         }
 
         // Activity log
@@ -1402,7 +1512,15 @@ impl ClamAvApp {
 impl Drop for ClamAvApp {
     fn drop(&mut self) {
         // Stop any active scan and kill the scan process
-        self.scan_engine.cancel_scan();
+        if self.scan_engine.state == ScanState::Scanning {
+            self.scan_engine.cancel_scan();
+        }
+
+        // 保存扫描历史
+        self.scan_engine.save_history(
+            &self.config.scan_history_path(),
+            &self.scan_target,
+        );
 
         if !self.config.persist_realtime_on_exit
             && self.realtime.state == RealtimeState::Running
@@ -1425,20 +1543,30 @@ impl eframe::App for ClamAvApp {
         self.updater.poll_messages();
         self.realtime.poll_messages();
 
-        // 扫描完成后自动隔离感染文件
+        // 扫描完成后自动隔离感染文件（仅扫描正常完成时，取消的扫描不自动隔离）
         if self.scan_engine.state == ScanState::Finished
             && !self.auto_quarantine_pending
             && !self.scan_engine.threats.is_empty()
+            && !self.scan_engine.was_cancelled
         {
             self.auto_quarantine_pending = true;
             let quarantine_dir = self.config.quarantine_dir.clone();
             let threats = self.scan_engine.threats.clone();
             let mut quarantined_count = 0u32;
-            for threat in &threats {
-                if let Ok(_) = self.scan_engine.quarantine_threat(threat, &quarantine_dir) {
+            let mut failed_indices: Vec<usize> = Vec::new();
+            for (i, threat) in threats.iter().enumerate() {
+                if self.scan_engine.quarantine_threat(threat, &quarantine_dir).is_ok() {
                     quarantined_count += 1;
+                } else {
+                    failed_indices.push(i);
                 }
             }
+            // 仅保留隔离失败的威胁条目
+            let remaining: Vec<_> = failed_indices
+                .iter()
+                .filter_map(|&i| threats.get(i).cloned())
+                .collect();
+            self.scan_engine.threats = remaining;
             if quarantined_count > 0 {
                 self.scan_engine.log_lines.push(format!(
                     "INFO: 已自动隔离 {} 个感染文件到隔离区",

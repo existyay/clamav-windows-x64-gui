@@ -151,4 +151,8 @@ impl AppConfig {
     pub fn freshclam_conf_path(&self) -> PathBuf {
         self.clamav_dir.join("freshclam.conf")
     }
+
+    pub fn scan_history_path(&self) -> PathBuf {
+        self.log_dir.join("scan-history.json")
+    }
 }

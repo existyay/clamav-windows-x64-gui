@@ -30,7 +30,7 @@ pub enum ScanMessage {
     Error(String),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ScanStats {
     pub scanned_files: u64,
     pub infected_files: u64,
@@ -38,10 +38,21 @@ pub struct ScanStats {
     pub elapsed_secs: f64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ThreatInfo {
     pub file_path: String,
     pub threat_name: String,
+}
+
+/// 持久化的扫描历史记录
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ScanHistory {
+    pub threats: Vec<ThreatInfo>,
+    pub stats: ScanStats,
+    pub log_lines: Vec<String>,
+    pub scan_target: String,
+    pub last_scan_time: String,
+    pub was_completed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -60,6 +71,8 @@ pub struct ScanEngine {
     pub cancel_flag: Arc<Mutex<bool>>,
     pub current_file: String,
     pub scan_started_at: Option<std::time::Instant>,
+    pub was_cancelled: bool,
+    stats_base: ScanStats,
     scan_child_id: Arc<Mutex<Option<u32>>>,
 }
 
@@ -74,6 +87,8 @@ impl Default for ScanEngine {
             cancel_flag: Arc::new(Mutex::new(false)),
             current_file: String::new(),
             scan_started_at: None,
+            was_cancelled: false,
+            stats_base: ScanStats::default(),
             scan_child_id: Arc::new(Mutex::new(None)),
         }
     }
@@ -97,21 +112,54 @@ impl ScanEngine {
         }
 
         self.state = ScanState::Scanning;
+        self.was_cancelled = false;
         self.threats.clear();
         self.stats = ScanStats::default();
+        self.stats_base = ScanStats::default();
         self.log_lines.clear();
         self.current_file.clear();
         self.scan_started_at = Some(std::time::Instant::now());
 
+        self.spawn_scan_thread(targets, config);
+    }
+
+    /// 继续扫描：不清除已有的威胁列表和日志，累加统计数据
+    pub fn continue_scan(&mut self, target: PathBuf, config: &AppConfig) {
+        self.continue_scan_targets(vec![target], config);
+    }
+
+    pub fn continue_scan_targets(&mut self, targets: Vec<PathBuf>, config: &AppConfig) {
+        if self.state == ScanState::Scanning {
+            self.log_lines.push("INFO: 扫描正在进行中，请先停止当前扫描".to_string());
+            return;
+        }
+
+        if targets.is_empty() {
+            self.state = ScanState::Finished;
+            self.log_lines.push("ERROR: No valid scan targets found".to_string());
+            return;
+        }
+
+        self.state = ScanState::Scanning;
+        self.was_cancelled = false;
+        // 保留已有的 threats 和 log_lines
+        // 将当前统计作为基准，后续累加
+        self.stats_base = self.stats.clone();
+        self.current_file.clear();
+        self.scan_started_at = Some(std::time::Instant::now());
+        self.log_lines.push("INFO: 继续扫描...".to_string());
+
+        self.spawn_scan_thread(targets, config);
+    }
+
+    fn spawn_scan_thread(&mut self, targets: Vec<PathBuf>, config: &AppConfig) {
         let cancel = Arc::new(Mutex::new(false));
         self.cancel_flag = cancel.clone();
 
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
 
-        // 始终使用 clamscan 进程模式（可靠地收集性能统计）
         let scanner_path = config.clamscan_path();
-
         let db_dir = config.database_dir.clone();
         let recursive = config.recursive_scan;
         let max_size = config.max_file_size_mb;
@@ -136,6 +184,7 @@ impl ScanEngine {
     }
 
     pub fn cancel_scan(&mut self) {
+        let was_scanning = self.state == ScanState::Scanning;
         // Set cancel flag
         if let Ok(mut flag) = self.cancel_flag.lock() {
             *flag = true;
@@ -150,7 +199,10 @@ impl ScanEngine {
         self.receiver = None;
         // 更新最终用时
         if let Some(started) = self.scan_started_at {
-            self.stats.elapsed_secs = started.elapsed().as_secs_f64();
+            self.stats.elapsed_secs = self.stats_base.elapsed_secs + started.elapsed().as_secs_f64();
+        }
+        if was_scanning {
+            self.was_cancelled = true;
         }
         self.state = ScanState::Finished;
         self.scan_started_at = None;
@@ -165,17 +217,30 @@ impl ScanEngine {
                         self.current_file = file;
                     }
                     ScanMessage::ThreatFound(info) => {
-                        self.log_lines.push(format!(
-                            "⚠ THREAT: {} -> {}",
-                            info.file_path, info.threat_name
-                        ));
-                        self.threats.push(info);
+                        // 去重：跳过已知的威胁（继续扫描时避免重复）
+                        if !self.threats.iter().any(|t| t.file_path == info.file_path) {
+                            self.log_lines.push(format!(
+                                "⚠ THREAT: {} -> {}",
+                                info.file_path, info.threat_name
+                            ));
+                            self.threats.push(info);
+                        }
                     }
                     ScanMessage::Stats(s) => {
-                        self.stats = s;
+                        self.stats = ScanStats {
+                            scanned_files: self.stats_base.scanned_files + s.scanned_files,
+                            infected_files: self.stats_base.infected_files + s.infected_files,
+                            scanned_data_mb: self.stats_base.scanned_data_mb + s.scanned_data_mb,
+                            elapsed_secs: self.stats_base.elapsed_secs + s.elapsed_secs,
+                        };
                     }
                     ScanMessage::Finished(s) => {
-                        self.stats = s;
+                        self.stats = ScanStats {
+                            scanned_files: self.stats_base.scanned_files + s.scanned_files,
+                            infected_files: self.stats_base.infected_files + s.infected_files,
+                            scanned_data_mb: self.stats_base.scanned_data_mb + s.scanned_data_mb,
+                            elapsed_secs: self.stats_base.elapsed_secs + s.elapsed_secs,
+                        };
                         self.state = ScanState::Finished;
                         self.scan_started_at = None;
                     }
@@ -190,9 +255,40 @@ impl ScanEngine {
 
         if self.state == ScanState::Scanning {
             if let Some(started) = self.scan_started_at {
-                self.stats.elapsed_secs = started.elapsed().as_secs_f64();
+                self.stats.elapsed_secs = self.stats_base.elapsed_secs + started.elapsed().as_secs_f64();
             }
         }
+    }
+
+    /// 保存扫描历史到文件
+    pub fn save_history(&self, path: &std::path::Path, scan_target: &str) {
+        let history = ScanHistory {
+            threats: self.threats.clone(),
+            stats: self.stats.clone(),
+            log_lines: self.log_lines.clone(),
+            scan_target: scan_target.to_string(),
+            last_scan_time: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            was_completed: self.state == ScanState::Finished && !self.was_cancelled,
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&history) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    /// 从文件加载扫描历史，返回扫描目标路径
+    pub fn load_history(&mut self, path: &std::path::Path) -> Option<String> {
+        let data = std::fs::read_to_string(path).ok()?;
+        let history: ScanHistory = serde_json::from_str(&data).ok()?;
+        if history.threats.is_empty() && history.stats.scanned_files == 0 && history.log_lines.is_empty() {
+            return None;
+        }
+        self.threats = history.threats;
+        self.stats = history.stats.clone();
+        self.stats_base = history.stats;
+        self.log_lines = history.log_lines;
+        self.was_cancelled = !history.was_completed;
+        self.state = ScanState::Finished;
+        Some(history.scan_target)
     }
 
     pub fn quarantine_threat(
@@ -211,7 +307,7 @@ impl ScanEngine {
             .unwrap_or_else(|| "unknown".into());
         let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
         let dest = quarantine_dir.join(format!("{}.{}.quarantine", name, ts));
-        std::fs::rename(&src, &dest).map_err(|e| e.to_string())?;
+        move_file_cross_drive(&src, &dest)?;
 
         // 保存元数据
         let meta = QuarantineMeta {
@@ -225,6 +321,21 @@ impl ScanEngine {
         }
 
         Ok(dest)
+    }
+}
+
+/// 移动文件，支持跨磁盘分区（rename 失败时回退到 copy + delete）
+fn move_file_cross_drive(src: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    match std::fs::rename(src, dest) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // rename 跨驱动器时会失败，回退到 copy + delete
+            std::fs::copy(src, dest)
+                .map_err(|e| format!("复制文件失败: {}", e))?;
+            std::fs::remove_file(src)
+                .map_err(|e| format!("删除原文件失败: {}", e))?;
+            Ok(())
+        }
     }
 }
 
@@ -272,7 +383,7 @@ pub fn restore_quarantined(entry: &QuarantineEntry) -> Result<(), String> {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    std::fs::rename(&entry.quarantine_path, &original)
+    move_file_cross_drive(&entry.quarantine_path, &original)
         .map_err(|e| format!("恢复失败: {}", e))?;
 
     // 删除元数据文件
@@ -454,34 +565,43 @@ fn run_scanner(
             Err(_) => continue,
         };
 
-        if line.contains("FOUND") {
+        // ClamAV 输出格式 (Windows):
+        //   威胁: "C:\path\to\file: ThreatName FOUND"
+        //   正常: "C:\path\to\file: OK"
+        //   扫描: "Scanning C:\path\to\file"
+        // 注意: 必须先检查行尾 " FOUND" 再检查 ": OK"，
+        //       避免文件名包含 "FOUND" 时误判。
+        //       用 rfind(": ") 来定位路径与状态的分隔符，
+        //       跳过 Windows 驱动器号 "C:" 中的冒号。
+
+        if line.ends_with(" FOUND") {
             infected += 1;
             scanned += 1;
-            let parts: Vec<&str> = line.splitn(2, ':').collect();
-            if parts.len() == 2 {
-                let file_path = parts[0].trim().to_string();
-                let threat_name = parts[1].trim().trim_end_matches("FOUND").trim().to_string();
-                // 累加文件大小
-                if let Ok(meta) = std::fs::metadata(&file_path) {
-                    scanned_data_mb += meta.len() as f64 / (1024.0 * 1024.0);
-                }
-                let _ = tx.send(ScanMessage::ThreatFound(ThreatInfo {
-                    file_path: file_path.clone(),
-                    threat_name,
-                }));
-                let _ = tx.send(ScanMessage::Progress(file_path));
-            }
-        } else if line.contains(": OK") {
-            scanned += 1;
-            if let Some(path) = line.split(": OK").next() {
-                let path = path.trim();
-                if !path.is_empty() {
-                    // 累加文件大小
-                    if let Ok(meta) = std::fs::metadata(path) {
+            // 去掉尾部 " FOUND"
+            let without_found = &line[..line.len() - " FOUND".len()];
+            // 找最后一个 ": " 作为路径与威胁名的分隔
+            if let Some(sep) = without_found.rfind(": ") {
+                let file_path = without_found[..sep].trim().to_string();
+                let threat_name = without_found[sep + 2..].trim().to_string();
+                if !file_path.is_empty() && !threat_name.is_empty() {
+                    if let Ok(meta) = std::fs::metadata(&file_path) {
                         scanned_data_mb += meta.len() as f64 / (1024.0 * 1024.0);
                     }
-                    let _ = tx.send(ScanMessage::Progress(path.to_string()));
+                    let _ = tx.send(ScanMessage::ThreatFound(ThreatInfo {
+                        file_path: file_path.clone(),
+                        threat_name,
+                    }));
+                    let _ = tx.send(ScanMessage::Progress(file_path));
                 }
+            }
+        } else if line.ends_with(": OK") {
+            scanned += 1;
+            let path = line[..line.len() - ": OK".len()].trim();
+            if !path.is_empty() {
+                if let Ok(meta) = std::fs::metadata(path) {
+                    scanned_data_mb += meta.len() as f64 / (1024.0 * 1024.0);
+                }
+                let _ = tx.send(ScanMessage::Progress(path.to_string()));
             }
             if last_stats_update.elapsed().as_secs_f64() > 1.0 {
                 let _ = tx.send(ScanMessage::Stats(ScanStats {
