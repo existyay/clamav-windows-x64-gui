@@ -288,6 +288,14 @@ fn scan_batch(
         cmd.arg(format!("--database={}", db_dir.display()));
     }
 
+    // 显式指定证书目录，覆盖编译时硬编码的路径
+    let certs_dir = clamscan.parent().map(|p| p.join("certs"));
+    if let Some(ref cd) = certs_dir {
+        if cd.exists() {
+            cmd.arg(format!("--cvdcertsdir={}", cd.display()));
+        }
+    }
+
     for file in files {
         cmd.arg(file);
     }

@@ -47,13 +47,14 @@ impl DatabaseUpdater {
 
         let freshclam = config.freshclam_path();
         let db_dir = config.database_dir.clone();
+        let certs_dir = config.clamav_dir.join("certs");
         let conf_path = config.freshclam_conf_path();
 
         // Ensure freshclam.conf exists
-        ensure_freshclam_conf(&conf_path, &db_dir);
+        ensure_freshclam_conf(&conf_path, &db_dir, &certs_dir);
 
         std::thread::spawn(move || {
-            run_freshclam(freshclam, conf_path, tx);
+            run_freshclam(freshclam, conf_path, certs_dir, tx);
         });
     }
 
@@ -148,8 +149,17 @@ impl DatabaseUpdater {
     }
 }
 
-fn ensure_freshclam_conf(conf_path: &std::path::Path, db_dir: &std::path::Path) {
-    if !conf_path.exists() {
+fn ensure_freshclam_conf(conf_path: &std::path::Path, db_dir: &std::path::Path, certs_dir: &std::path::Path) {
+    // 如果已有配置但缺少 CVDCertsDirectory，则重新生成
+    let needs_regen = if conf_path.exists() {
+        std::fs::read_to_string(conf_path)
+            .map(|c| !c.contains("CVDCertsDirectory"))
+            .unwrap_or(true)
+    } else {
+        true
+    };
+
+    if needs_regen {
         let content = format!(
             "# China mirror sources for faster downloads in mainland China\n\
              # Uncomment the mirror closest to you for best performance\n\
@@ -163,11 +173,13 @@ fn ensure_freshclam_conf(conf_path: &std::path::Path, db_dir: &std::path::Path) 
              DatabaseMirror database.clamav.net\n\
              \n\
              DatabaseDirectory {}\n\
+             CVDCertsDirectory {}\n\
              Foreground yes\n\
              MaxAttempts 5\n\
              ConnectTimeout 30\n\
              ReceiveTimeout 60\n",
-            db_dir.display()
+            db_dir.display(),
+            certs_dir.display()
         );
         let _ = std::fs::write(conf_path, content);
     }
@@ -176,6 +188,7 @@ fn ensure_freshclam_conf(conf_path: &std::path::Path, db_dir: &std::path::Path) 
 fn run_freshclam(
     freshclam_path: std::path::PathBuf,
     conf_path: std::path::PathBuf,
+    certs_dir: std::path::PathBuf,
     tx: mpsc::Sender<UpdateMessage>,
 ) {
     if !freshclam_path.exists() {
@@ -191,6 +204,11 @@ fn run_freshclam(
 
     if conf_path.exists() {
         cmd.arg(format!("--config-file={}", conf_path.display()));
+    }
+
+    // 显式指定证书目录，覆盖编译时硬编码的路径
+    if certs_dir.exists() {
+        cmd.arg(format!("--cvdcertsdir={}", certs_dir.display()));
     }
 
     cmd.stdout(Stdio::piped());

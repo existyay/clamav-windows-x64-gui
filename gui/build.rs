@@ -23,35 +23,7 @@ fn generate_embed_manifest() {
     let mut entries: Vec<(String, String)> = Vec::new();
 
     if embed_dir.exists() && embed_dir.is_dir() {
-        if let Ok(dir) = std::fs::read_dir(&embed_dir) {
-            for entry in dir.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if path.is_file() {
-                    // 跳过 README 等非二进制文件
-                    let ext = path
-                        .extension()
-                        .map(|e| e.to_string_lossy().to_lowercase())
-                        .unwrap_or_default();
-                    if ext == "md" || ext == "txt" {
-                        continue;
-                    }
-                    if let Some(filename) = path.file_name() {
-                        let filename = filename.to_string_lossy().to_string();
-                        if let Ok(abs_path) = std::fs::canonicalize(&path) {
-                            let abs_str = abs_path.to_string_lossy().to_string();
-                            // 移除 Windows canonicalize 添加的 \\?\ UNC 前缀
-                            let abs_str = if abs_str.starts_with(r"\\?\") {
-                                abs_str[4..].to_string()
-                            } else {
-                                abs_str
-                            };
-                            let abs_str = abs_str.replace('\\', "/");
-                            entries.push((filename, abs_str));
-                        }
-                    }
-                }
-            }
-        }
+        collect_embed_files(&embed_dir, &embed_dir, &mut entries);
     }
 
     let mut code = String::new();
@@ -75,4 +47,41 @@ fn generate_embed_manifest() {
     }
 
     std::fs::write(&manifest_path, code).expect("Failed to write embed manifest");
+}
+
+/// 递归收集 embed 目录中的所有文件，保留相对路径
+fn collect_embed_files(
+    base: &std::path::Path,
+    dir: &std::path::Path,
+    entries: &mut Vec<(String, String)>,
+) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for entry in rd.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_embed_files(base, &path, entries);
+        } else if path.is_file() {
+            let ext = path
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            if ext == "md" || ext == "txt" {
+                continue;
+            }
+            // 保留相对于 base 的路径（如 "database/main.cvd"）
+            if let Ok(rel) = path.strip_prefix(base) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                if let Ok(abs_path) = std::fs::canonicalize(&path) {
+                    let abs_str = abs_path.to_string_lossy().to_string();
+                    let abs_str = if abs_str.starts_with(r"\\?\") {
+                        abs_str[4..].to_string()
+                    } else {
+                        abs_str
+                    };
+                    let abs_str = abs_str.replace('\\', "/");
+                    entries.push((rel_str, abs_str));
+                }
+            }
+        }
+    }
 }
