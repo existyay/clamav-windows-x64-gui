@@ -345,28 +345,47 @@ impl ClamAvApp {
     }
 
     fn start_quick_scan(&mut self) {
-        // Quick scan should cover multiple critical locations.
-        let mut candidates = Vec::new();
+        // Quick scan: system critical areas first, then user high-risk dirs.
+        let mut system_targets = Vec::new();
+        let mut user_targets = Vec::new();
 
-        if let Some(home) = dirs::home_dir() {
-            candidates.push(home.join("Downloads"));
-            candidates.push(home.join("Desktop"));
-            candidates.push(home.join("Documents"));
-            candidates.push(home.join("AppData").join("Local").join("Temp"));
-        }
-
-        if let Ok(temp) = std::env::var("TEMP") {
-            candidates.push(std::path::PathBuf::from(temp));
-        }
-
+        // --- 系统关键区域（优先扫描） ---
         if let Ok(windir) = std::env::var("WINDIR") {
-            candidates.push(std::path::PathBuf::from(windir).join("Temp"));
+            let win = std::path::PathBuf::from(&windir);
+            system_targets.push(win.join("System32\\drivers"));
+            system_targets.push(win.join("System32\\Tasks"));
+            system_targets.push(win.join("Temp"));
+            system_targets.push(win.join("SysWOW64"));
+        }
+        if let Ok(pd) = std::env::var("ProgramData") {
+            let pd = std::path::PathBuf::from(&pd);
+            system_targets.push(pd.join("Microsoft\\Windows\\Start Menu\\Programs\\Startup"));
+        }
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            system_targets.push(std::path::PathBuf::from(pf));
+        }
+        if let Ok(pf86) = std::env::var("ProgramFiles(x86)") {
+            system_targets.push(std::path::PathBuf::from(pf86));
         }
 
+        // --- 用户高风险目录 ---
+        if let Some(home) = dirs::home_dir() {
+            user_targets.push(home.join("Downloads"));
+            user_targets.push(home.join("Desktop"));
+            user_targets.push(home.join("Documents"));
+            user_targets.push(home.join("AppData\\Local\\Temp"));
+            user_targets.push(home.join("AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"));
+            user_targets.push(home.join("AppData\\Local\\Microsoft\\Windows\\INetCache"));
+        }
+        if let Ok(temp) = std::env::var("TEMP") {
+            user_targets.push(std::path::PathBuf::from(temp));
+        }
+
+        // 系统目录优先，用户目录在后
         let mut targets = Vec::new();
-        for path in candidates {
-            if path.exists() && !targets.iter().any(|p| p == &path) {
-                targets.push(path);
+        for path in system_targets.iter().chain(user_targets.iter()) {
+            if path.exists() && !targets.iter().any(|p| p == path) {
+                targets.push(path.clone());
             }
         }
 
@@ -375,17 +394,16 @@ impl ClamAvApp {
             return;
         }
 
-        let preview = targets
-            .iter()
-            .take(3)
-            .map(|p| p.to_string_lossy().to_string())
-            .collect::<Vec<_>>()
-            .join("; ");
-        self.scan_target = if targets.len() > 3 {
-            format!("快速扫描: {} ... (共 {} 个路径)", preview, targets.len())
-        } else {
-            format!("快速扫描: {}", preview)
-        };
+        // 分区域显示扫描提示
+        let sys_count = targets.iter().filter(|p| {
+            let s = p.to_string_lossy().to_lowercase();
+            s.contains("windows") || s.contains("program")
+        }).count();
+        let usr_count = targets.len() - sys_count;
+        self.scan_target = format!(
+            "快速扫描: {} 个系统关键目录 + {} 个用户目录 (共 {} 个路径)",
+            sys_count, usr_count, targets.len()
+        );
 
         self.auto_quarantine_pending = false;
         self.scan_engine.start_scan_targets(targets, &self.config);
