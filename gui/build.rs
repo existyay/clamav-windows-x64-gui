@@ -3,6 +3,13 @@ fn main() {
     {
         let mut res = winresource::WindowsResource::new();
         res.set_manifest_file("app.manifest");
+        // 完整的版本信息资源，降低 AI 启发式误报
+        res.set("FileDescription", "ClamAV Antivirus Scanner GUI");
+        res.set("ProductName", "ClamAV GUI");
+        res.set("CompanyName", "ClamAV Open Source");
+        res.set("LegalCopyright", "Copyright (C) 2024-2026 ClamAV GUI Contributors");
+        res.set("OriginalFilename", "clamav-gui.exe");
+        res.set("InternalName", "clamav-gui");
         if let Err(e) = res.compile() {
             eprintln!("Warning: Failed to compile Windows resource: {}", e);
         }
