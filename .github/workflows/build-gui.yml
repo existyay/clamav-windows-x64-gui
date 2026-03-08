@@ -212,6 +212,57 @@ jobs:
           Get-ChildItem $embedDir | Format-Table Name, Length -AutoSize
         shell: pwsh
 
+      - name: Download and embed YAMAGoya
+        run: |
+          $yamaDir = "gui\embed\yamagoya"
+          New-Item -ItemType Directory -Path $yamaDir -Force | Out-Null
+          New-Item -ItemType Directory -Path "$yamaDir\amd64" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$yamaDir\rules" -Force | Out-Null
+
+          $ProgressPreference = 'SilentlyContinue'
+          $zipUrl = "https://github.com/JPCERTCC/YAMAGoya/releases/download/v1.0.0/YAMAGoya.v1.0.0.x64.zip"
+          $zipPath = "$yamaDir\yamagoya.zip"
+
+          Write-Host "Downloading YAMAGoya v1.0.0..."
+          Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
+
+          Write-Host "Extracting YAMAGoya..."
+          Expand-Archive -Path $zipPath -DestinationPath "$yamaDir\tmp" -Force
+
+          # Move all files from extracted to embed dir
+          Get-ChildItem "$yamaDir\tmp" -File | Move-Item -Destination $yamaDir -Force
+          if (Test-Path "$yamaDir\tmp\amd64") {
+            Get-ChildItem "$yamaDir\tmp\amd64" -File | Move-Item -Destination "$yamaDir\amd64" -Force
+          }
+
+          # Clean up
+          Remove-Item $zipPath -Force
+          Remove-Item "$yamaDir\tmp" -Recurse -Force
+          Remove-Item "$yamaDir\install.bat" -Force -ErrorAction SilentlyContinue
+
+          # Rules should already exist from repo checkout (gui/embed/yamagoya/rules/)
+          # If not, download from GitHub
+          if (-not (Test-Path "$yamaDir\rules\*.yml")) {
+            $ruleFiles = @(
+              "detect_invoke-sharploader.yml",
+              "detect_lsass_dump.yml",
+              "detect_malware_sample.yml",
+              "detect_ransomeware_using_decoy.yml",
+              "detect_wmi_activity.yml"
+            )
+            foreach ($f in $ruleFiles) {
+              Invoke-WebRequest -Uri "https://raw.githubusercontent.com/JPCERTCC/YAMAGoya/main/rules/$f" -OutFile "$yamaDir\rules\$f" -UseBasicParsing
+              Write-Host "Downloaded rule: $f"
+            }
+          }
+
+          Write-Host "YAMAGoya embedded files:"
+          Get-ChildItem $yamaDir -Recurse -File | ForEach-Object {
+            $sizeMB = [math]::Round($_.Length / 1MB, 2)
+            Write-Host "  $($_.Name) ($sizeMB MB)"
+          }
+        shell: pwsh
+
       - name: Build GUI
         run: |
           cd gui
@@ -256,6 +307,9 @@ jobs:
           New-Item -ItemType Directory -Path "$outputDir\clamav\certs" -Force | Out-Null
           New-Item -ItemType Directory -Path "$outputDir\quarantine" -Force | Out-Null
           New-Item -ItemType Directory -Path "$outputDir\logs" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$outputDir\yamagoya" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$outputDir\yamagoya\rules" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$outputDir\yamagoya\amd64" -Force | Out-Null
 
           # Copy GUI
           Copy-Item $guiExe "$outputDir\ClamAV-Scanner.exe"
@@ -274,6 +328,25 @@ jobs:
 
           # Copy certs
           Copy-Item "$clamavInstall\certs\*" "$outputDir\clamav\certs\" -Recurse -ErrorAction SilentlyContinue
+
+          # Copy YAMAGoya
+          $yamaEmbed = "gui\embed\yamagoya"
+          if (Test-Path "$yamaEmbed\YAMAGoya.exe") {
+            Get-ChildItem "$yamaEmbed\*.exe","$yamaEmbed\*.dll" | ForEach-Object {
+              Copy-Item $_.FullName "$outputDir\yamagoya\$($_.Name)"
+            }
+            if (Test-Path "$yamaEmbed\amd64") {
+              Get-ChildItem "$yamaEmbed\amd64\*.dll" | ForEach-Object {
+                Copy-Item $_.FullName "$outputDir\yamagoya\amd64\$($_.Name)"
+              }
+            }
+            Get-ChildItem "$yamaEmbed\rules\*.yml" -ErrorAction SilentlyContinue | ForEach-Object {
+              Copy-Item $_.FullName "$outputDir\yamagoya\rules\$($_.Name)"
+            }
+            Write-Host "YAMAGoya copied to portable package"
+          } else {
+            Write-Host "::warning::YAMAGoya.exe not found, skipping YAMAGoya in portable package"
+          }
 
           # Config files
           @"
@@ -366,7 +439,7 @@ jobs:
             - 🎨 现代化深色/浅色主题切换
             - ⚡ 快速扫描系统关键位置
             - 💿 全盘扫描功能
-            - 🛡️ 实时保护（基于系统文件监控 API，即时检测）
+            - 🛡️ 实时保护（YAMAGoya ETW 行为监控，基于 Sigma/YAML/YARA 规则）
             - 🔄 病毒库在线更新
             - 🔒 威胁自动隔离 + 批量删除/恢复管理
             - 📊 美化的仪表盘和统计可视化

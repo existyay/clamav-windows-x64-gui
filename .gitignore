@@ -250,3 +250,10 @@ gui/fonts/
 # Embedded ClamAV binaries (user-supplied, not tracked)
 gui/embed/clamav/*
 !gui/embed/clamav/README.md
+
+# Embedded YAMAGoya binaries (downloaded by CI, not tracked)
+gui/embed/yamagoya/*.exe
+gui/embed/yamagoya/*.dll
+gui/embed/yamagoya/amd64/
+!gui/embed/yamagoya/README.md
+!gui/embed/yamagoya/rules/
