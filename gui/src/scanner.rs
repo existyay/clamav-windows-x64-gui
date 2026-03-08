@@ -355,6 +355,10 @@ fn run_scanner(
             if parts.len() == 2 {
                 let file_path = parts[0].trim().to_string();
                 let threat_name = parts[1].trim().trim_end_matches("FOUND").trim().to_string();
+                // 累加文件大小
+                if let Ok(meta) = std::fs::metadata(&file_path) {
+                    scanned_data_mb += meta.len() as f64 / (1024.0 * 1024.0);
+                }
                 let _ = tx.send(ScanMessage::ThreatFound(ThreatInfo {
                     file_path: file_path.clone(),
                     threat_name,
@@ -366,6 +370,10 @@ fn run_scanner(
             if let Some(path) = line.split(": OK").next() {
                 let path = path.trim();
                 if !path.is_empty() {
+                    // 累加文件大小
+                    if let Ok(meta) = std::fs::metadata(path) {
+                        scanned_data_mb += meta.len() as f64 / (1024.0 * 1024.0);
+                    }
                     let _ = tx.send(ScanMessage::Progress(path.to_string()));
                 }
             }
