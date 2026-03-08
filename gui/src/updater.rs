@@ -1,7 +1,9 @@
 use crate::config::AppConfig;
 use std::io::{BufRead, BufReader};
+use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub enum UpdateMessage {
@@ -150,39 +152,52 @@ impl DatabaseUpdater {
 }
 
 fn ensure_freshclam_conf(conf_path: &std::path::Path, db_dir: &std::path::Path, certs_dir: &std::path::Path) {
-    // 如果已有配置但缺少 CVDCertsDirectory，则重新生成
-    let needs_regen = if conf_path.exists() {
-        std::fs::read_to_string(conf_path)
-            .map(|c| !c.contains("CVDCertsDirectory"))
-            .unwrap_or(true)
-    } else {
-        true
-    };
+    // 每次更新前重新检测镜像可用性并生成配置
+    let mirrors = [
+        "mirrors.tuna.tsinghua.edu.cn",
+        "mirrors.ustc.edu.cn",
+        "mirrors.nju.edu.cn",
+    ];
 
-    if needs_regen {
-        let content = format!(
-            "# China mirror sources for faster downloads in mainland China\n\
-             # Uncomment the mirror closest to you for best performance\n\
-             \n\
-             # Primary mirrors - try China sources first\n\
-             PrivateMirror mirrors.tuna.tsinghua.edu.cn\n\
-             PrivateMirror mirrors.ustc.edu.cn\n\
-             PrivateMirror mirrors.nju.edu.cn\n\
-             \n\
-             # Official mirror (fallback)\n\
-             DatabaseMirror database.clamav.net\n\
-             \n\
-             DatabaseDirectory {}\n\
-             CVDCertsDirectory {}\n\
-             Foreground yes\n\
-             MaxAttempts 5\n\
-             ConnectTimeout 30\n\
-             ReceiveTimeout 60\n",
-            db_dir.display(),
-            certs_dir.display()
-        );
-        let _ = std::fs::write(conf_path, content);
+    let reachable: Vec<&str> = mirrors
+        .iter()
+        .filter(|host| test_mirror_reachable(host))
+        .copied()
+        .collect();
+
+    let mut content = String::new();
+    if reachable.is_empty() {
+        content.push_str("# 国内镜像不可用，使用官方源\n");
+        content.push_str("DatabaseMirror database.clamav.net\n\n");
+    } else {
+        content.push_str("# 可用的国内镜像源\n");
+        for host in &reachable {
+            content.push_str(&format!("PrivateMirror {}\n", host));
+        }
+        content.push('\n');
     }
+
+    content.push_str(&format!("DatabaseDirectory {}\n", db_dir.display()));
+    content.push_str(&format!("CVDCertsDirectory {}\n", certs_dir.display()));
+    content.push_str("Foreground yes\n");
+    content.push_str("MaxAttempts 5\n");
+    content.push_str("ConnectTimeout 30\n");
+    content.push_str("ReceiveTimeout 60\n");
+
+    let _ = std::fs::write(conf_path, content);
+}
+
+/// 测试镜像主机是否可达（TCP 连接 80 端口，3 秒超时）
+fn test_mirror_reachable(host: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let addr = match format!("{}:80", host).to_socket_addrs() {
+        Ok(mut addrs) => match addrs.next() {
+            Some(a) => a,
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok()
 }
 
 fn run_freshclam(
