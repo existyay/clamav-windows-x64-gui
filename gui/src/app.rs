@@ -6,6 +6,7 @@ use crate::config::AppConfig;
 use crate::scanner::{ScanEngine, ScanState};
 use crate::realtime::{RealtimeProtection, RealtimeState};
 use crate::theme;
+use crate::tray;
 use crate::updater::{DatabaseUpdater, UpdateState};
 
 #[derive(PartialEq, Clone, Copy)]
@@ -34,6 +35,9 @@ pub struct ClamAvApp {
     // Quarantine state
     quarantine_selected: HashSet<String>,
     auto_quarantine_pending: bool,
+    // System tray
+    tray: Option<tray::SystemTray>,
+    minimized_to_tray: bool,
 }
 
 impl ClamAvApp {
@@ -73,6 +77,8 @@ impl ClamAvApp {
             settings_exclude,
             quarantine_selected: HashSet::new(),
             auto_quarantine_pending: false,
+            tray: None,
+            minimized_to_tray: false,
         }
     }
 
@@ -1540,6 +1546,45 @@ impl Drop for ClamAvApp {
 
 impl eframe::App for ClamAvApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // --- 系统托盘：拦截关闭事件 ---
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.realtime.state == RealtimeState::Running {
+                // YAMAGoya 运行中：取消关闭，最小化到系统托盘
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.minimized_to_tray = true;
+                if self.tray.is_none() {
+                    self.tray = tray::SystemTray::new();
+                }
+            }
+        }
+
+        // --- 系统托盘：处理菜单事件 ---
+        let tray_action = self.tray.as_ref().and_then(|t| t.poll_event());
+        if let Some(action) = tray_action {
+            match action {
+                tray::TrayAction::ShowWindow => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.minimized_to_tray = false;
+                }
+                tray::TrayAction::Exit => {
+                    self.realtime.stop(&self.config);
+                    self.minimized_to_tray = false;
+                    self.tray = None;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
+                }
+            }
+        }
+
+        // --- 托盘模式下仅轮询消息，不绘制 UI ---
+        if self.minimized_to_tray {
+            self.realtime.poll_messages();
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            return;
+        }
+
         if !self.theme_applied {
             theme::apply_theme(ctx, self.config.dark_mode);
             self.theme_applied = true;

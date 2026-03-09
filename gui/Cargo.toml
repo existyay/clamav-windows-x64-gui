@@ -16,6 +16,7 @@ chrono = { version = "0.4", features = ["serde"] }
 open = "5"
 dirs = "6"
 zstd = "0.13"
+tray-icon = "0.21"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_Foundation"] }

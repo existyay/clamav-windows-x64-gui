@@ -7,6 +7,7 @@ mod app;
 mod theme;
 mod config;
 mod embedded;
+mod tray;
 
 use eframe::egui;
 
