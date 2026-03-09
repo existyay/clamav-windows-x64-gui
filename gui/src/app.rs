@@ -1554,7 +1554,7 @@ impl eframe::App for ClamAvApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 self.minimized_to_tray = true;
                 if self.tray.is_none() {
-                    self.tray = tray::SystemTray::new();
+                    self.tray = tray::SystemTray::new(ctx.clone());
                 }
             }
         }
@@ -1565,10 +1565,19 @@ impl eframe::App for ClamAvApp {
             match action {
                 tray::TrayAction::ShowWindow => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     self.minimized_to_tray = false;
                 }
-                tray::TrayAction::Exit => {
+                tray::TrayAction::StopRealtime => {
+                    self.realtime.stop(&self.config);
+                    self.minimized_to_tray = false;
+                    self.tray = None;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                tray::TrayAction::ExitApp => {
                     self.realtime.stop(&self.config);
                     self.minimized_to_tray = false;
                     self.tray = None;

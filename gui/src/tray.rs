@@ -1,32 +1,43 @@
+use eframe::egui;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, MenuId, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use std::sync::mpsc;
 
 pub enum TrayAction {
     ShowWindow,
-    Exit,
+    StopRealtime,
+    ExitApp,
 }
 
 pub struct SystemTray {
     _tray: TrayIcon,
     _show_item: MenuItem,
+    _stop_item: MenuItem,
     _exit_item: MenuItem,
     show_id: MenuId,
+    stop_id: MenuId,
     exit_id: MenuId,
+    rx: mpsc::Receiver<MenuEvent>,
 }
 
 impl SystemTray {
-    pub fn new() -> Option<Self> {
+    pub fn new(ctx: egui::Context) -> Option<Self> {
         let menu = Menu::new();
 
         let show_item = MenuItem::new("显示主界面", true, None);
-        let exit_item = MenuItem::new("退出实时保护", true, None);
+        let stop_item = MenuItem::new("退出实时保护", true, None);
+        let exit_item = MenuItem::new("退出程序", true, None);
 
         let show_id = show_item.id().clone();
+        let stop_id = stop_item.id().clone();
         let exit_id = exit_item.id().clone();
 
-        let sep = PredefinedMenuItem::separator();
+        let sep1 = PredefinedMenuItem::separator();
+        let sep2 = PredefinedMenuItem::separator();
         menu.append(&show_item).ok()?;
-        menu.append(&sep).ok()?;
+        menu.append(&sep1).ok()?;
+        menu.append(&stop_item).ok()?;
+        menu.append(&sep2).ok()?;
         menu.append(&exit_item).ok()?;
 
         let icon = create_shield_icon();
@@ -38,20 +49,34 @@ impl SystemTray {
             .build()
             .ok()?;
 
+        // Use a custom event handler that wakes the egui event loop.
+        // Without this, update() is never called while the window is
+        // hidden (Visible(false)) on Windows, so tray clicks are lost.
+        let (tx, rx) = mpsc::channel();
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            let _ = tx.send(event);
+            ctx.request_repaint();
+        }));
+
         Some(Self {
             _tray: tray,
             _show_item: show_item,
+            _stop_item: stop_item,
             _exit_item: exit_item,
             show_id,
+            stop_id,
             exit_id,
+            rx,
         })
     }
 
     pub fn poll_event(&self) -> Option<TrayAction> {
-        let receiver = MenuEvent::receiver();
-        while let Ok(event) = receiver.try_recv() {
+        while let Ok(event) = self.rx.try_recv() {
             if event.id == self.exit_id {
-                return Some(TrayAction::Exit);
+                return Some(TrayAction::ExitApp);
+            }
+            if event.id == self.stop_id {
+                return Some(TrayAction::StopRealtime);
             }
             if event.id == self.show_id {
                 return Some(TrayAction::ShowWindow);
