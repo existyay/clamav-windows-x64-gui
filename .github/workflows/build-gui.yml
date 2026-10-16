@@ -8,13 +8,20 @@ on:
   workflow_dispatch:
     inputs:
       create_release:
-        description: 'Create GitHub Release'
+        description: 'Publish the rolling "latest" release'
         required: false
         default: true
         type: boolean
 
 permissions:
   contents: write
+
+env:
+  # The project publishes exactly one release, under this single tag. Every run
+  # moves the tag and replaces the release, so the Releases page never grows
+  # again. The prune step below also deletes anything left over from the old
+  # per-version scheme (v1.0.x tags and their releases).
+  RELEASE_TAG: latest
 
 jobs:
   build:
@@ -25,58 +32,22 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get version info
+      - name: Read version
         id: version
         run: |
-          # Read current version from Cargo.toml
+          # The version is used for naming and display only. It is deliberately
+          # not bumped and committed any more: the release tag is fixed, so the
+          # per-run version commit only added merge noise to main.
           $cargoToml = Get-Content "gui\Cargo.toml" -Raw
-          if ($cargoToml -match 'version = "(\d+)\.(\d+)\.(\d+)"') {
-            $major = [int]$matches[1]
-            $minor = [int]$matches[2]
-            $patch = [int]$matches[3]
+          if ($cargoToml -match 'version = "([^"]+)"') {
+            $version = $matches[1]
           } else {
-            $major = 1
-            $minor = 0
-            $patch = 0
+            $version = "0.0.0"
           }
 
-          # Fixed bump strategy: always patch
-          $patch++
-
-          $newVersion = "$major.$minor.$patch"
-          $tagName = "v$newVersion"
-
-          # Check if tag already exists
-          git fetch --tags
-          $tagExists = git tag -l $tagName
-          if ($tagExists) {
-            Write-Host "Tag $tagName already exists, adding build number"
-            $buildNum = $env:GITHUB_RUN_NUMBER
-            $newVersion = "$major.$minor.$patch-build$buildNum"
-            $tagName = "v$newVersion"
-          }
-
-          # Output version info
-          echo "version=$newVersion" >> $env:GITHUB_OUTPUT
-          echo "tag=$tagName" >> $env:GITHUB_OUTPUT
-          echo "major=$major" >> $env:GITHUB_OUTPUT
-          echo "minor=$minor" >> $env:GITHUB_OUTPUT
-          echo "patch=$patch" >> $env:GITHUB_OUTPUT
-
-          Write-Host "New version: $newVersion"
-          Write-Host "Tag: $tagName"
-        shell: pwsh
-
-      - name: Update version in files
-        run: |
-          $newVersion = "${{ steps.version.outputs.version }}"
-
-          # Update Cargo.toml
-          $cargoToml = Get-Content "gui\Cargo.toml" -Raw
-          $cargoToml = $cargoToml -replace 'version = "\d+\.\d+\.\d+.*?"', "version = `"$newVersion`""
-          Set-Content "gui\Cargo.toml" $cargoToml
-
-          Write-Host "Updated Cargo.toml to version $newVersion"
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "build=$env:GITHUB_RUN_NUMBER" >> $env:GITHUB_OUTPUT
+          Write-Host "Version: $version (published under the fixed tag '$env:RELEASE_TAG')"
         shell: pwsh
 
       - name: Setup MSVC
@@ -171,17 +142,29 @@ jobs:
         run: |
           Write-Host "Using cached build/install (skipping CMake configure+build)."
 
-      - name: Prepare Chinese font
+      - name: Stage the CJK font
+        continue-on-error: true
         run: |
           New-Item -ItemType Directory -Path gui\fonts -Force | Out-Null
-          # Try Microsoft YaHei first, fall back to SimSun
-          $fontSrc = @("$env:SystemRoot\Fonts\msyh.ttc", "$env:SystemRoot\Fonts\simsun.ttc", "$env:SystemRoot\Fonts\malgun.ttf") | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if ($fontSrc) {
-            Copy-Item $fontSrc "gui\fonts\NotoSansSC-Regular.ttf" -Force
-            Write-Host "Font copied from: $fontSrc"
-          } else {
-            Write-Host "::warning::No CJK font found, downloading Noto Sans SC"
-            Invoke-WebRequest -Uri 'https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansSC-Regular.otf' -OutFile 'gui\fonts\NotoSansSC-Regular.ttf' -UseBasicParsing
+
+          # Noto Sans SC is licensed under the SIL Open Font License and may be
+          # redistributed. Do NOT copy from $env:SystemRoot\Fonts here: those
+          # files (msyh.ttc, simsun.ttc, malgun.ttf) are proprietary Microsoft
+          # fonts and packing one into a release is a licence violation. An
+          # earlier version of this workflow did exactly that, saving the result
+          # under a "NotoSansSC-Regular.ttf" name even though it was a TrueType
+          # collection.
+          #
+          # The application renders Chinese with the Windows system font when no
+          # bundled font is present, so this download is an optional extra for
+          # systems that have had their CJK fonts removed.
+          $dest = "gui\fonts\NotoSansSC-Regular.otf"
+          try {
+            Invoke-WebRequest -Uri 'https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansSC-Regular.otf' -OutFile $dest -UseBasicParsing
+            $mb = [math]::Round((Get-Item $dest).Length / 1MB, 1)
+            Write-Host "Noto Sans SC staged: $dest ($mb MB)"
+          } catch {
+            Write-Host "::warning::Could not download Noto Sans SC; the app will use the Windows system CJK font."
           }
         shell: pwsh
 
@@ -282,6 +265,8 @@ jobs:
 
           @"
           Version: $version
+          Release tag: $env:RELEASE_TAG
+          Build number: $env:GITHUB_RUN_NUMBER
           Build Time: $buildTime
           Commit: $commitHash
           "@ | Set-Content "dist\BUILD_INFO.txt"
@@ -310,9 +295,20 @@ jobs:
           New-Item -ItemType Directory -Path "$outputDir\yamagoya" -Force | Out-Null
           New-Item -ItemType Directory -Path "$outputDir\yamagoya\rules" -Force | Out-Null
           New-Item -ItemType Directory -Path "$outputDir\yamagoya\amd64" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$outputDir\fonts" -Force | Out-Null
 
           # Copy GUI
           Copy-Item $guiExe "$outputDir\ClamAV-Scanner.exe"
+
+          # Bundle the OFL CJK font next to the executable. The GUI looks for a
+          # `fonts\` folder beside itself before falling back to the Windows
+          # system CJK font.
+          if (Test-Path "gui\fonts") {
+            Get-ChildItem "gui\fonts\*.otf","gui\fonts\*.ttf","gui\fonts\*.ttc" -ErrorAction SilentlyContinue | ForEach-Object {
+              Copy-Item $_.FullName "$outputDir\fonts\$($_.Name)"
+              Write-Host "Bundled font: $($_.Name)"
+            }
+          }
 
           # Copy ClamAV executables
           $exes = @("clamscan.exe","freshclam.exe","clamd.exe","clamdscan.exe")
@@ -394,71 +390,132 @@ jobs:
           name: ClamAV-Scanner-Standalone-x64-${{ steps.version.outputs.version }}
           path: dist/ClamAV-Scanner-Standalone-x64.exe
 
-      - name: Commit version bump
-        if: github.event_name != 'pull_request'
+      - name: Prune every other tag and release
+        if: github.event_name != 'pull_request' && github.event.inputs.create_release != 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add gui/Cargo.toml
-          if (Test-Path "gui/Cargo.lock") {
-            git add gui/Cargo.lock
+          # One release, one tag. Anything else is a leftover from the old
+          # per-version scheme (v1.0.1 … v1.0.8), so it is deleted here together
+          # with its attached archives. This is deliberate and irreversible:
+          # those downloads no longer exist after this step runs.
+          $keep = $env:RELEASE_TAG
+
+          gh release list --limit 200 --json tagName --jq '.[].tagName' | ForEach-Object {
+            $tag = $_.Trim()
+            if ($tag -and $tag -ne $keep) {
+              Write-Host "Deleting release and tag: $tag"
+              gh release delete $tag --yes --cleanup-tag
+            }
           }
-          git diff --staged --quiet || git commit -m "chore: bump version to ${{ steps.version.outputs.version }} [skip ci]"
-          git push origin HEAD:${{ github.ref_name }}
+
+          # Tags that never had a release, or were left behind by a failed run.
+          git fetch --tags --force
+          git tag --list | ForEach-Object {
+            if ($_ -ne $keep) {
+              Write-Host "Deleting stray tag: $_"
+              git push origin --delete $_ 2>$null
+              git tag --delete $_ 2>$null
+            }
+          }
+
+          Write-Host "Remaining releases:"
+          gh release list --limit 200
+        shell: pwsh
+
+      - name: Drop the previous release for this tag
+        if: github.event_name != 'pull_request' && github.event.inputs.create_release != 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Removing it first means the publish below always *creates* a release
+          # rather than updating one, so the assets can never collide or go
+          # stale, and the tag is moved to this build.
+          gh release delete $env:RELEASE_TAG --yes --cleanup-tag
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "No existing '$env:RELEASE_TAG' release; nothing to drop."
+          }
         shell: pwsh
         continue-on-error: true
 
-      - name: Create and push tag
-        if: github.event_name != 'pull_request'
+      - name: Move the rolling tag
+        if: github.event_name != 'pull_request' && github.event.inputs.create_release != 'false'
         run: |
-          $tag = "${{ steps.version.outputs.tag }}"
-          git tag -a $tag -m "Release $tag"
-          git push origin $tag
+          git tag -f $env:RELEASE_TAG
+          git push --force origin $env:RELEASE_TAG
         shell: pwsh
 
-      - name: Create GitHub Release
+      - name: Publish the rolling release
         if: github.event_name != 'pull_request' && (github.event.inputs.create_release == 'true' || github.event.inputs.create_release == '')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: ClamAV GUI ${{ steps.version.outputs.version }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ClamAV GUI ${{ steps.version.outputs.version }} · 最新版（build ${{ steps.version.outputs.build }}）
           files: |
             dist/ClamAV-GUI-Portable-x64.zip
             dist/ClamAV-Scanner-Standalone-x64.exe
-          generate_release_notes: true
+          generate_release_notes: false
           draft: false
           prerelease: false
+          make_latest: true
           body: |
-            ## ClamAV Windows x64 GUI - v${{ steps.version.outputs.version }}
+            ## ClamAV Windows x64 GUI · 最新版
+
+            这是本项目**唯一**的发布：标签固定为 `latest`，每次构建都会覆盖本页的
+            安装包与说明，所以下载地址永远不变（固定链接见下）。历史版本不再保留。
+
+            - 固定下载（永久有效）：
+              `https://github.com/${{ github.repository }}/releases/latest/download/ClamAV-GUI-Portable-x64.zip`
+              `https://github.com/${{ github.repository }}/releases/latest/download/ClamAV-Scanner-Standalone-x64.exe`
 
             ### 📦 下载
             - **便携版**: ClamAV-GUI-Portable-x64.zip（解压即用）
             - **单文件版**: ClamAV-Scanner-Standalone-x64.exe（内嵌全部依赖，首次启动自动释放）
 
             ### ✨ 功能特性
-            - 🎨 现代化深色/浅色主题切换
-            - ⚡ 快速扫描系统关键位置
-            - 💿 全盘扫描功能
+            - 🎨 类纸风格界面：暖白纸面 / 深色墨板两套配色，矢量图标与纸张纹理
+            - 🔍 快速扫描、全盘扫描与自定义目标（支持拖放文件）
+            - 💿 按磁盘类型识别本地磁盘，自动跳过可移动介质
             - 🛡️ 实时保护（YAMAGoya ETW 行为监控，基于 Sigma/YAML/YARA 规则）
-            - 🔄 病毒库在线更新
-            - 🔒 威胁自动隔离 + 批量删除/恢复管理
-            - 📊 美化的仪表盘和统计可视化
-            - ⚙️ 灵活的扫描配置选项
+            - 🔄 病毒库在线更新（可取消，实时显示下载进度）
+            - 🔒 威胁隔离区：单项恢复 / 删除，支持筛选
+            - 📊 总览面板：威胁、扫描统计、病毒库版本与实时保护状态
+            - ⚙️ 扫描预设（快速 / 均衡 / 彻底）与正则排除规则
 
-            ### 🚀 性能优化
-            - 多线程并行扫描（4线程）
-            - 优化的扫描速度（2-4倍提升）
-            - 实时显示扫描进度和当前文件
+            ### 🚀 性能
+            - 日志视图按需绘制（虚拟滚动），十万行日志与十行开销相同
+            - 按界面状态自适应重绘，空闲时不再持续占用 CPU
+            - 扫描进度合并上报，避免逐文件刷新界面
+            - 可选的多进程并行扫描（默认关闭：每个进程会各自加载一份病毒库）
+
+            ### 🐛 最近修复
+            - 每个页面都需要向下滚动：页头右上角操作区按整页高度居中，页头被撑到
+              409px；现在七个页面都正好填满窗口，底部不再留空白
+            - 隔离区 / 日志等空状态改为整页卡片承载提示，不再有大片空白
+            - 报错信息不再输出完整本地路径（曾泄露账号名与目录结构）
+            - 中文界面此前因未加载任何 CJK 字体而显示为方块
+            - 病毒库 `GiB`/`KiB` 单位被当作 `MB` 解析，体积显示偏差可达 1024 倍
+            - 扫描设置中的「邮件 / Office / PDF / HTML / 启发式」选项此前从未传给扫描引擎
+            - 默认排除规则是无效正则（`target\debug` 中的 `\d` 会匹配数字）
+            - 长中文路径截断时会 panic（按字节切分导致越界）
+            - 系统托盘创建失败时关闭窗口会导致程序无法再打开
+            - Windows 已回收的 PID 可能被误杀（现在会校验进程映像路径）
+            - 退出时后台实时保护可能来不及停止
+            - 旧版配置文件会丢失 YAMAGoya 路径
+            - 程序此前总是请求管理员权限，且该请求与工具链自带清单冲突；现在改为按需提权
 
             ### 📝 使用说明
             1. 解压到任意目录
             2. 运行 `ClamAV-Scanner.exe`
             3. 首次使用建议先更新病毒库
+            4. 需要扫描或隔离 `C:\Windows` 下的受保护位置时，请在「设置」中点击
+               **以管理员身份重启**
 
             ### 🔧 系统要求
             - Windows 10/11 x64
-            - .NET Framework 4.7.2+（系统自带）
+            - 单文件版首次启动会释放内置组件，需要数秒
 
             ---
-            **构建时间**: ${{ github.event.repository.updated_at }}
+            **版本**: ${{ steps.version.outputs.version }}
+            **构建编号**: ${{ steps.version.outputs.build }}
             **提交**: ${{ github.sha }}
