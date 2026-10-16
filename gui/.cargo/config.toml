@@ -1,0 +1,14 @@
+# Link the C runtime statically for the GNU toolchain.
+#
+# Without this, a `windows-gnu` build of the GUI depends on MinGW DLLs that are
+# not present on a clean Windows machine (`libgcc_s_seh-1.dll`,
+# `libwinpthread-1.dll`, `libstdc++-6.dll`), so the "portable" zip would not
+# actually run.
+#
+# Matched on target *properties* rather than a single triple so every Windows
+# GNU target gets it — x86_64-pc-windows-gnu today, and i686/aarch64 GNU targets
+# if they are ever added — while the MSVC toolchain used by the release workflow
+# keeps its default, which already works and is what the shipped binaries are
+# built with.
+[target.'cfg(all(windows, target_env = "gnu"))']
+rustflags = ["-C", "target-feature=+crt-static"]

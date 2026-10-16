@@ -41,3 +41,14 @@ jobs:
           cd gui
           cargo check
         shell: pwsh
+
+      # These used to be impossible to run: the build linked a manifest that
+      # required elevation into the test harness, so the test binary refused to
+      # start from a normal shell ("os error 740"). With that fixed the unit
+      # tests cover the argument builder, the clamscan output parsers, the
+      # config migrations and the path/size formatters.
+      - name: Cargo test
+        run: |
+          cd gui
+          cargo test
+        shell: pwsh

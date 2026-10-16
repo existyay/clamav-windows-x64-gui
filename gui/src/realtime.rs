@@ -1,9 +1,36 @@
+//! Realtime protection, backed by the bundled YAMAGoya ETW monitor.
+//!
+//! YAMAGoya runs as a detached background process that writes to a log file;
+//! this module supervises its lifetime and tails that log.
+//!
+//! Safety notes
+//! ------------
+//! The PID recorded on disk is not trusted on its own. PIDs are recycled by
+//! Windows, so a stale pid file whose number has been handed to an unrelated
+//! process would previously have caused us to `TerminateProcess` that innocent
+//! program. The daemon is now only signalled once its executable image has been
+//! verified against the expected path.
+//!
+//! Shutdown is also synchronous when the app is exiting: the old code spawned a
+//! thread from `Drop`, which the process teardown usually killed before it had
+//! done anything, leaving the monitor running.
+
 use crate::config::AppConfig;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Tail poll interval when the log has no new content.
+const TAIL_IDLE: Duration = Duration::from_millis(250);
+/// Roll the daemon log over once it grows past this size.
+const LOG_ROTATE_BYTES: u64 = 16 * 1024 * 1024;
+/// Retained log lines.
+const MAX_LOG_LINES: usize = 4000;
+/// Retained threat records.
+const MAX_THREATS: usize = 2000;
 
 #[derive(Clone, Debug)]
 pub enum RealtimeMessage {
@@ -16,7 +43,7 @@ pub enum RealtimeMessage {
     Stopped,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RealtimeState {
     Stopped,
     Running,
@@ -32,8 +59,12 @@ pub struct RealtimeThreat {
 pub struct RealtimeProtection {
     pub state: RealtimeState,
     pub threats: Vec<RealtimeThreat>,
-    pub scanned_count: u64,
+    /// Number of log events seen, i.e. how busy the monitor has been. This is
+    /// *not* a count of scanned files.
+    pub monitored_events: u64,
     pub log_lines: Vec<String>,
+    pub daemon_pid: Option<u32>,
+    pub last_error: Option<String>,
     cancel_flag: Arc<Mutex<bool>>,
     receiver: Option<mpsc::Receiver<RealtimeMessage>>,
 }
@@ -43,128 +74,302 @@ impl Default for RealtimeProtection {
         Self {
             state: RealtimeState::Stopped,
             threats: Vec::new(),
-            scanned_count: 0,
+            monitored_events: 0,
             log_lines: Vec::new(),
+            daemon_pid: None,
+            last_error: None,
             cancel_flag: Arc::new(Mutex::new(false)),
             receiver: None,
         }
     }
 }
 
-/// PID 文件路径（用于追踪后台常驻进程）
-fn pid_file_path(log_dir: &std::path::Path) -> PathBuf {
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
+
+fn pid_file_path(log_dir: &Path) -> PathBuf {
     log_dir.join("yamagoya.pid")
 }
 
-/// YAMAGoya 日志文件路径
-fn yamagoya_log_path(log_dir: &std::path::Path) -> PathBuf {
+/// Log file the daemon is told to write to.
+pub fn yamagoya_log_path(log_dir: &Path) -> PathBuf {
     log_dir.join("yamagoya-realtime.log")
 }
 
-/// 读取 PID 文件
-fn read_pid(log_dir: &std::path::Path) -> Option<u32> {
-    let path = pid_file_path(log_dir);
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
+/// A pid file records the process id *and* the image path it should belong to.
+struct DaemonRecord {
+    pid: u32,
+    image: Option<PathBuf>,
 }
 
-/// 写入 PID 文件
-fn write_pid(log_dir: &std::path::Path, pid: u32) {
-    let path = pid_file_path(log_dir);
-    let _ = std::fs::write(&path, pid.to_string());
+fn read_daemon_record(log_dir: &Path) -> Option<DaemonRecord> {
+    let text = std::fs::read_to_string(pid_file_path(log_dir)).ok()?;
+    let mut lines = text.lines();
+    let pid = lines.next()?.trim().parse::<u32>().ok()?;
+    let image = lines
+        .next()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from);
+    Some(DaemonRecord { pid, image })
 }
 
-/// 删除 PID 文件
-fn remove_pid(log_dir: &std::path::Path) {
-    let path = pid_file_path(log_dir);
-    let _ = std::fs::remove_file(&path);
+fn write_daemon_record(log_dir: &Path, pid: u32, image: &Path) {
+    let content = format!("{}\n{}", pid, image.display());
+    let _ = std::fs::write(pid_file_path(log_dir), content);
 }
 
-/// 检查 PID 对应的进程是否仍在运行（Windows）
+fn remove_daemon_record(log_dir: &Path) {
+    let _ = std::fs::remove_file(pid_file_path(log_dir));
+}
+
+// ---------------------------------------------------------------------------
+// Process introspection
+// ---------------------------------------------------------------------------
+
+/// Whether a process with this id currently exists.
 fn is_process_alive(pid: u32) -> bool {
     #[cfg(target_os = "windows")]
     {
-        // OpenProcess with PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        let handle = unsafe {
-            windows_sys::Win32::System::Threading::OpenProcess(0x1000, 0, pid)
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         };
+
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if handle.is_null() {
             return false;
         }
         let mut exit_code: u32 = 0;
-        let result = unsafe {
-            windows_sys::Win32::System::Threading::GetExitCodeProcess(
-                handle,
-                &mut exit_code,
-            )
-        };
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(handle);
-        }
-        // STILL_ACTIVE = 259
-        result != 0 && exit_code == 259
+        let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+        unsafe { CloseHandle(handle) };
+        // STILL_ACTIVE
+        ok != 0 && exit_code == 259
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(unix)]
     {
+        // /proc is Linux; other unices report "not alive", which only means the
+        // GUI will not try to re-attach to a previous session.
+        Path::new(&format!("/proc/{}", pid)).exists()
+    }
+    #[cfg(not(any(target_os = "windows", unix)))]
+    {
+        let _ = pid;
         false
     }
 }
 
-impl RealtimeProtection {
-    /// 尝试重新连接到已运行的后台 YAMAGoya 进程
-    pub fn try_reconnect(&mut self, config: &AppConfig) {
-        if self.state == RealtimeState::Running {
-            return;
-        }
-        if let Some(pid) = read_pid(&config.log_dir) {
-            if is_process_alive(pid) {
-                // 进程仍在运行，重新连接日志轮询
-                let cancel = Arc::new(Mutex::new(false));
-                self.cancel_flag = cancel.clone();
-                self.state = RealtimeState::Running;
+/// Full image path of a running process, if it can be read.
+#[cfg(target_os = "windows")]
+fn process_image_path(pid: u32) -> Option<PathBuf> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
 
-                let (tx, rx) = mpsc::channel();
-                self.receiver = Some(rx);
-
-                let log_path = yamagoya_log_path(&config.log_dir);
-
-                let _ = tx.send(RealtimeMessage::Info(format!(
-                    "重新连接到后台 YAMAGoya 进程 (PID: {})",
-                    pid
-                )));
-
-                std::thread::spawn(move || {
-                    tail_log_loop(log_path, cancel, tx);
-                });
-            } else {
-                // PID 文件存在但进程已退出，清理
-                remove_pid(&config.log_dir);
-            }
-        }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
     }
 
-    pub fn start(&mut self, config: &AppConfig) {
-        if self.state == RealtimeState::Running {
+    let mut buffer = vec![0u16; 1024];
+    let mut size = buffer.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) };
+    unsafe { CloseHandle(handle) };
+
+    if ok == 0 || size == 0 {
+        return None;
+    }
+    buffer.truncate(size as usize);
+    Some(PathBuf::from(String::from_utf16_lossy(&buffer)))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn process_image_path(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+/// Do two paths refer to the same executable?
+fn same_executable(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| {
+        p.to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    let (a, b) = (norm(a), norm(b));
+    !a.is_empty() && a == b
+}
+
+fn tail_log_loop(log_path: PathBuf, cancel: Arc<Mutex<bool>>, tx: mpsc::Sender<RealtimeMessage>) {
+    // Wait for the daemon to create its log.
+    for _ in 0..40 {
+        if log_path.exists() {
+            break;
+        }
+        if cancelled(&cancel) {
+            let _ = tx.send(RealtimeMessage::Stopped);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let mut reader = match open_at_end(&log_path) {
+        Ok(reader) => reader,
+        Err(e) => {
+            let _ = tx.send(RealtimeMessage::Error(format!(
+                "无法打开 YAMAGoya 日志: {}",
+                e
+            )));
+            let _ = tx.send(RealtimeMessage::Stopped);
+            return;
+        }
+    };
+
+    let mut line = String::with_capacity(512);
+
+    loop {
+        if cancelled(&cancel) {
+            let _ = tx.send(RealtimeMessage::Stopped);
             return;
         }
 
-        let yamagoya = config.yamagoya_path();
-        if !yamagoya.exists() {
-            self.log_lines.push(format!(
-                "ERROR: YAMAGoya 未找到: {}",
-                yamagoya.display()
-            ));
+        // Detect truncation or log rotation: the file is shorter than the
+        // position we are reading from, so start over.
+        let position = reader.stream_position().unwrap_or(0);
+        if let Ok(meta) = std::fs::metadata(&log_path) {
+            if meta.len() < position {
+                reader = match open_at_end(&log_path) {
+                    Ok(reader) => reader,
+                    Err(_) => {
+                        std::thread::sleep(TAIL_IDLE);
+                        continue;
+                    }
+                };
+                line.clear();
+                continue;
+            }
+        }
+
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => std::thread::sleep(TAIL_IDLE),
+            Ok(_) => {
+                let text = line.trim_end_matches(['\r', '\n']);
+                if !text.is_empty() {
+                    if let Some(message) = parse_yamagoya_line(text) {
+                        if tx.send(message).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(_) => std::thread::sleep(TAIL_IDLE),
+        }
+    }
+}
+
+fn cancelled(flag: &Arc<Mutex<bool>>) -> bool {
+    flag.lock().map(|f| *f).unwrap_or(false)
+}
+
+/// Open a file positioned at its current end (so pre-existing content is not
+/// replayed), falling back to the start when the file is empty.
+fn open_at_end(path: &Path) -> std::io::Result<BufReader<std::fs::File>> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let _ = reader.seek(SeekFrom::End(0));
+    Ok(reader)
+}
+
+// ---------------------------------------------------------------------------
+// Engine
+// ---------------------------------------------------------------------------
+
+impl RealtimeProtection {
+    pub fn is_running(&self) -> bool {
+        self.state == RealtimeState::Running
+    }
+
+    /// Re-attach to a daemon that outlived the previous GUI session.
+    pub fn try_reconnect(&mut self, config: &AppConfig) {
+        if self.is_running() {
+            return;
+        }
+
+        let Some(record) = read_daemon_record(&config.log_dir) else {
+            return;
+        };
+
+        let expected = config.yamagoya_path();
+
+        // Verify identity, not just liveness: PIDs get reused.
+        let identity_ok = match process_image_path(record.pid) {
+            Some(actual) => same_executable(&actual, &expected),
+            None => record
+                .image
+                .as_ref()
+                .map(|recorded| same_executable(recorded, &expected))
+                .unwrap_or(false),
+        };
+
+        if !is_process_alive(record.pid) || !identity_ok {
+            remove_daemon_record(&config.log_dir);
             return;
         }
 
         let cancel = Arc::new(Mutex::new(false));
         self.cancel_flag = cancel.clone();
         self.state = RealtimeState::Running;
+        self.daemon_pid = Some(record.pid);
 
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
 
+        let _ = tx.send(RealtimeMessage::Info(format!(
+            "已重新连接到后台实时保护进程 (PID {})",
+            record.pid
+        )));
+
+        let log_path = yamagoya_log_path(&config.log_dir);
+        std::thread::spawn(move || tail_log_loop(log_path, cancel, tx));
+    }
+
+    /// Launch the monitor. Returns an error when YAMAGoya is unavailable.
+    pub fn start(&mut self, config: &AppConfig) -> Result<(), String> {
+        if self.is_running() {
+            return Ok(());
+        }
+
+        let yamagoya = config.yamagoya_path();
+        if !yamagoya.exists() {
+            let message = format!(
+                "未找到 YAMAGoya 监控程序: {}",
+                crate::config::display_path(&yamagoya)
+            );
+            self.push_log(format!("ERROR: {}", message));
+            self.last_error = Some(message.clone());
+            return Err(message);
+        }
+
+        // Keep the log bounded across sessions.
+        let log_path = yamagoya_log_path(&config.log_dir);
+        rotate_log_if_large(&log_path);
+        let _ = std::fs::create_dir_all(&config.log_dir);
+        let _ = std::fs::write(&log_path, "");
+
+        let cancel = Arc::new(Mutex::new(false));
+        self.cancel_flag = cancel.clone();
+        self.state = RealtimeState::Running;
+        self.last_error = None;
+
+        let (tx, rx) = mpsc::channel();
+        self.receiver = Some(rx);
+
+        // Copy everything the worker needs out of `config` before spawning: the
+        // thread outlives this call, so it cannot hold a borrow of it.
+        let yamagoya_for_start = yamagoya.clone();
         let rules_dir = config.yamagoya_rules_dir.clone();
         let rule_type = config.yamagoya_rule_type.clone();
         let monitor_all = config.yamagoya_monitor_all;
@@ -173,7 +378,7 @@ impl RealtimeProtection {
 
         std::thread::spawn(move || {
             yamagoya_daemon_start(
-                yamagoya,
+                yamagoya_for_start,
                 rules_dir,
                 rule_type,
                 monitor_all,
@@ -183,15 +388,14 @@ impl RealtimeProtection {
                 tx,
             );
         });
+
+        Ok(())
     }
 
+    /// Ask the monitor to stop; the teardown happens on a worker thread.
     pub fn stop(&mut self, config: &AppConfig) {
-        if let Ok(mut flag) = self.cancel_flag.lock() {
-            *flag = true;
-        }
-        self.state = RealtimeState::Stopped;
+        self.begin_stop();
 
-        // 后台终止 YAMAGoya 进程
         let yamagoya = config.yamagoya_path();
         let log_dir = config.log_dir.clone();
         std::thread::spawn(move || {
@@ -199,52 +403,93 @@ impl RealtimeProtection {
         });
     }
 
+    /// Stop synchronously. Required from `Drop`, where a spawned thread would be
+    /// torn down before it could finish.
+    pub fn stop_blocking(&mut self, config: &AppConfig) {
+        self.begin_stop();
+        stop_yamagoya_daemon(&config.yamagoya_path(), &config.log_dir);
+    }
+
+    fn begin_stop(&mut self) {
+        if let Ok(mut flag) = self.cancel_flag.lock() {
+            *flag = true;
+        }
+        self.state = RealtimeState::Stopped;
+        self.daemon_pid = None;
+    }
+
     pub fn poll_messages(&mut self) {
-        if let Some(ref rx) = self.receiver {
+        if let Some(rx) = self.receiver.take() {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
                     RealtimeMessage::ThreatFound {
                         rule_name,
                         description,
                     } => {
-                        let ts =
-                            chrono::Local::now().format("%H:%M:%S").to_string();
-                        self.log_lines.push(format!(
-                            "[{}] ⚠ DETECTED: {} - {}",
-                            ts, rule_name, description
-                        ));
+                        let ts = chrono::Local::now().format("%H:%M:%S").to_string();
+                        self.monitored_events += 1;
+                        self.push_log(format!("[{}] DETECTED: {} - {}", ts, rule_name, description));
+                        if self.threats.len() >= MAX_THREATS {
+                            self.threats.drain(0..MAX_THREATS / 4);
+                        }
                         self.threats.push(RealtimeThreat {
                             file_path: description,
                             threat_name: rule_name,
                             timestamp: ts,
                         });
-                        if self.threats.len() > 500 {
-                            self.threats.drain(0..100);
-                        }
                     }
                     RealtimeMessage::Info(text) => {
-                        self.scanned_count += 1;
-                        let ts =
-                            chrono::Local::now().format("%H:%M:%S").to_string();
-                        self.log_lines
-                            .push(format!("[{}] {}", ts, text));
-                        if self.log_lines.len() > 2000 {
-                            self.log_lines.drain(0..500);
-                        }
+                        self.monitored_events += 1;
+                        let ts = chrono::Local::now().format("%H:%M:%S").to_string();
+                        self.push_log(format!("[{}] {}", ts, text));
                     }
                     RealtimeMessage::Error(e) => {
-                        self.log_lines.push(format!("ERROR: {}", e));
+                        self.last_error = Some(e.clone());
+                        self.push_log(format!("ERROR: {}", e));
                     }
                     RealtimeMessage::Stopped => {
                         self.state = RealtimeState::Stopped;
+                        self.daemon_pid = None;
                     }
                 }
             }
+            self.receiver = Some(rx);
+        }
+    }
+
+    fn push_log(&mut self, line: String) {
+        if self.log_lines.len() >= MAX_LOG_LINES {
+            self.log_lines.drain(0..MAX_LOG_LINES / 4);
+        }
+        self.log_lines.push(line);
+    }
+}
+
+impl Drop for RealtimeProtection {
+    fn drop(&mut self) {
+        if let Ok(mut flag) = self.cancel_flag.lock() {
+            *flag = true;
         }
     }
 }
 
-/// 启动 YAMAGoya 后台常驻进程，并开始轮询其日志文件
+/// Move an oversized daemon log aside before a fresh session starts.
+fn rotate_log_if_large(log_path: &Path) {
+    let Ok(meta) = std::fs::metadata(log_path) else {
+        return;
+    };
+    if meta.len() <= LOG_ROTATE_BYTES {
+        return;
+    }
+
+    let mut rotated = log_path.as_os_str().to_os_string();
+    rotated.push(".1");
+    let rotated = PathBuf::from(rotated);
+    let _ = std::fs::remove_file(&rotated);
+    let _ = std::fs::rename(log_path, &rotated);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn yamagoya_daemon_start(
     yamagoya_path: PathBuf,
     rules_dir: PathBuf,
@@ -255,10 +500,8 @@ fn yamagoya_daemon_start(
     cancel: Arc<Mutex<bool>>,
     tx: mpsc::Sender<RealtimeMessage>,
 ) {
-    // 构建命令行参数
     let mut args: Vec<String> = vec!["--session".to_string()];
 
-    // 添加规则类型和目录
     let rules_dir_str = rules_dir.to_string_lossy().to_string();
     if rules_dir.exists() {
         match rule_type.as_str() {
@@ -275,9 +518,13 @@ fn yamagoya_daemon_start(
                 args.push(rules_dir_str);
             }
         }
+    } else {
+        let _ = tx.send(RealtimeMessage::Error(format!(
+            "规则目录不存在: {}",
+            crate::config::display_path(&rules_dir)
+        )));
     }
 
-    // 监控类别
     if monitor_all {
         args.push("--all".to_string());
     } else {
@@ -292,19 +539,30 @@ fn yamagoya_daemon_start(
     args.push("--verbose".to_string());
     args.push("--no_event_log".to_string());
 
-    // 使用日志文件输出（后台常驻模式）
     let log_path = yamagoya_log_path(&log_dir);
     args.push("--log_path".to_string());
     args.push(log_path.to_string_lossy().to_string());
 
-    let _ = tx.send(RealtimeMessage::Info(format!(
-        "启动 YAMAGoya 后台进程: {} {}",
-        yamagoya_path.display(),
-        args.join(" ")
-    )));
+    // The command line is echoed into the log panel, and it is full of absolute
+    // paths (`--log_path`, the rules directory). Show them relative to the app
+    // directory instead of exposing the user's folder layout.
+    let shown_args: Vec<String> = args
+        .iter()
+        .map(|arg| {
+            let path = std::path::Path::new(arg);
+            if path.is_absolute() {
+                crate::config::display_path(path)
+            } else {
+                arg.clone()
+            }
+        })
+        .collect();
 
-    // 先清理可能残留的旧日志
-    let _ = std::fs::write(&log_path, "");
+    let _ = tx.send(RealtimeMessage::Info(format!(
+        "启动实时保护: {} {}",
+        crate::config::display_path(&yamagoya_path),
+        shown_args.join(" ")
+    )));
 
     let mut cmd = Command::new(&yamagoya_path);
     cmd.args(&args)
@@ -316,20 +574,21 @@ fn yamagoya_daemon_start(
     {
         use std::os::windows::process::CommandExt;
         // CREATE_NO_WINDOW | DETACHED_PROCESS
-        cmd.creation_flags(0x08000000 | 0x00000008);
+        cmd.creation_flags(0x0800_0000 | 0x0000_0008);
     }
 
     match cmd.spawn() {
         Ok(child) => {
             let pid = child.id();
-            write_pid(&log_dir, pid);
+            // Hand the child off; we do not wait on it.
+            drop(child);
+            write_daemon_record(&log_dir, pid, &yamagoya_path);
 
             let _ = tx.send(RealtimeMessage::Info(format!(
-                "YAMAGoya 后台进程已启动 (PID: {})",
+                "实时保护已启动 (PID {})",
                 pid
             )));
 
-            // 开始轮询日志文件
             tail_log_loop(log_path, cancel, tx);
         }
         Err(e) => {
@@ -342,120 +601,108 @@ fn yamagoya_daemon_start(
     }
 }
 
-/// 轮询日志文件，解析新增行（tail -f 模式）
-fn tail_log_loop(
-    log_path: PathBuf,
-    cancel: Arc<Mutex<bool>>,
-    tx: mpsc::Sender<RealtimeMessage>,
-) {
-    // 等待日志文件出现
-    for _ in 0..30 {
-        if log_path.exists() {
-            break;
-        }
-        if cancel.lock().map(|f| *f).unwrap_or(false) {
-            let _ = tx.send(RealtimeMessage::Stopped);
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
+/// Stop the daemon: release the ETW session, then terminate the process.
+///
+/// The daemon is only terminated once its image has been verified, so a
+/// recycled PID can never take down an unrelated program.
+fn stop_yamagoya_daemon(yamagoya_path: &Path, log_dir: &Path) {
+    release_etw_session(yamagoya_path);
 
-    let file = match std::fs::File::open(&log_path) {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = tx.send(RealtimeMessage::Error(format!(
-                "无法打开 YAMAGoya 日志: {}",
-                e
-            )));
-            let _ = tx.send(RealtimeMessage::Stopped);
-            return;
-        }
+    let Some(record) = read_daemon_record(log_dir) else {
+        return;
     };
 
-    let mut reader = BufReader::new(file);
-    // 跳到文件末尾，只读取新内容
-    let _ = reader.seek(SeekFrom::End(0));
+    let verified = match process_image_path(record.pid) {
+        Some(actual) => same_executable(&actual, yamagoya_path),
+        None => record
+            .image
+            .as_ref()
+            .map(|recorded| same_executable(recorded, yamagoya_path))
+            .unwrap_or(false),
+    };
 
-    loop {
-        if cancel.lock().map(|f| *f).unwrap_or(false) {
-            let _ = tx.send(RealtimeMessage::Stopped);
-            return;
-        }
-
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
-                // 没有新内容，休眠后重试
-                std::thread::sleep(std::time::Duration::from_millis(300));
-            }
-            Ok(_) => {
-                let line = line.trim_end().to_string();
-                if !line.is_empty() {
-                    if let Some(msg) = parse_yamagoya_line(&line) {
-                        if tx.send(msg).is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
-        }
+    if verified {
+        kill_process(record.pid);
     }
+
+    remove_daemon_record(log_dir);
 }
 
-/// 停止 YAMAGoya 后台进程
-fn stop_yamagoya_daemon(yamagoya_path: &std::path::Path, log_dir: &std::path::Path) {
-    // 先发送 --stop 停止 ETW 会话
-    stop_etw_session(yamagoya_path);
-
-    // 通过 PID 终止进程
-    if let Some(pid) = read_pid(log_dir) {
-        kill_process_by_pid(pid);
-        remove_pid(log_dir);
+/// Run `YAMAGoya --stop` to release the ETW session, with a bounded wait.
+///
+/// `Command::output()` used to block indefinitely here, which could hang the
+/// whole shutdown path.
+fn release_etw_session(yamagoya_path: &Path) {
+    if !yamagoya_path.exists() {
+        return;
     }
-}
 
-/// 终止指定 PID 的进程
-fn kill_process_by_pid(pid: u32) {
+    let mut cmd = Command::new(yamagoya_path);
+    cmd.arg("--stop")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null());
+
     #[cfg(target_os = "windows")]
     {
-        let handle = unsafe {
-            windows_sys::Win32::System::Threading::OpenProcess(0x0001, 0, pid) // PROCESS_TERMINATE
-        };
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+
+    let Ok(mut child) = cmd.spawn() else {
+        return;
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// Terminate a process by id.
+fn kill_process(pid: u32) {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
         if !handle.is_null() {
             unsafe {
-                windows_sys::Win32::System::Threading::TerminateProcess(handle, 1);
-                windows_sys::Win32::Foundation::CloseHandle(handle);
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
             }
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = pid;
+        let _ = Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
-/// 停止 YAMAGoya ETW 会话
-fn stop_etw_session(yamagoya_path: &std::path::Path) {
-    let mut cmd = Command::new(yamagoya_path);
-    cmd.arg("--stop");
+// ---------------------------------------------------------------------------
+// Log parsing
+// ---------------------------------------------------------------------------
 
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
-    }
-
-    let _ = cmd.output();
-}
-
-/// 解析 YAMAGoya 的输出行
+/// Parse one line of YAMAGoya output.
 fn parse_yamagoya_line(line: &str) -> Option<RealtimeMessage> {
-    // [INFO] {timestamp} DETECTED (Sigma): {title} - {description}
-    if let Some(idx) = line.find("DETECTED (Sigma): ") {
-        let rest = &line[idx + "DETECTED (Sigma): ".len()..];
+    if let Some(index) = line.find("DETECTED (Sigma): ") {
+        let rest = &line[index + "DETECTED (Sigma): ".len()..];
         let (rule_name, description) = split_rule_desc(rest);
         return Some(RealtimeMessage::ThreatFound {
             rule_name,
@@ -463,10 +710,9 @@ fn parse_yamagoya_line(line: &str) -> Option<RealtimeMessage> {
         });
     }
 
-    // [INFO] {timestamp} DETECTED: {rulename} - {description}
-    if let Some(idx) = line.find("DETECTED: ") {
-        let rest = &line[idx + "DETECTED: ".len()..];
-        // 跳过纯 PID 信息行
+    if let Some(index) = line.find("DETECTED: ") {
+        let rest = &line[index + "DETECTED: ".len()..];
+        // Pure PID bookkeeping lines are not detections.
         if rest.starts_with("PID=") {
             return Some(RealtimeMessage::Info(line.to_string()));
         }
@@ -477,21 +723,20 @@ fn parse_yamagoya_line(line: &str) -> Option<RealtimeMessage> {
         });
     }
 
-    if line.starts_with("[ERROR]") {
+    if line.contains("[ERROR]") {
         Some(RealtimeMessage::Error(line.to_string()))
     } else {
         Some(RealtimeMessage::Info(line.to_string()))
     }
 }
 
-/// 从 "rulename - description" 格式中提取规则名和描述
-fn split_rule_desc(s: &str) -> (String, String) {
-    if let Some(dash_idx) = s.find(" - ") {
-        (
-            s[..dash_idx].to_string(),
-            s[dash_idx + 3..].to_string(),
-        )
-    } else {
-        (s.to_string(), String::new())
+/// Split `"rulename - description"`.
+fn split_rule_desc(text: &str) -> (String, String) {
+    match text.find(" - ") {
+        Some(index) => (
+            text[..index].trim().to_string(),
+            text[index + 3..].trim().to_string(),
+        ),
+        None => (text.trim().to_string(), String::new()),
     }
 }

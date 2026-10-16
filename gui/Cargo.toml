@@ -5,10 +5,16 @@ edition = "2021"
 description = "Modern GUI for ClamAV antivirus scanner"
 
 [dependencies]
-eframe = { version = "0.31", features = ["persistence"] }
+# `persistence` is deliberately off: window geometry is stored in the app's own
+# config file, and the feature only pulled in `ron` plus a second serde wiring.
+eframe = { version = "0.31", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
 egui = "0.31"
-egui_extras = { version = "0.31", features = ["image"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -19,43 +25,37 @@ zstd = "0.13"
 tray-icon = "0.21"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_Security", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [build-dependencies]
 winresource = "0.1"
 zstd = "0.13"
 
 [profile.release]
-opt-level = "s"
+# `opt-level = 3` rather than "s": the layout, font rasterisation and paper
+# grain generation are all CPU-side, and the size difference is small next to
+# the embedded toolchain.
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+strip = "symbols"
+
+# Dependencies are optimised even in debug builds, which is the difference
+# between a usable and an unusable egui app while developing.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1
 
 [[bin]]
 name = "clamav-gui"
 path = "src/main.rs"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

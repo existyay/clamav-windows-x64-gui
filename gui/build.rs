@@ -1,9 +1,31 @@
 fn main() {
+    // Editing this script or the embedded payload must invalidate the build;
+    // otherwise the previously linked resources stay in place and a change
+    // appears to do nothing.
+    println!("cargo:rerun-if-changed=build.rs");
+
     #[cfg(target_os = "windows")]
     {
         let mut res = winresource::WindowsResource::new();
-        res.set_manifest_file("app.manifest");
-        // 完整的版本信息资源，降低 AI 启发式误报
+
+        // Only version information — deliberately no manifest.
+        //
+        // An explicit manifest used to be attached here as well, which caused
+        // two problems. The GNU toolchain already embeds a default manifest of
+        // its own, so the binary ended up carrying both; the linker reported
+        // ".rsrc merge failure: multiple non-default manifests" and which one
+        // Windows honoured was effectively arbitrary. That made a release build
+        // request no elevation while the test harness demanded it, so
+        // `cargo test` died with "os error 740: the requested operation
+        // requires elevation".
+        //
+        // Nothing is lost by letting the toolchain's manifest stand: DPI
+        // awareness does not depend on it at all. winit installs it at runtime
+        // (`become_dpi_aware()` in its Windows backend, called when the event
+        // loop is created) via `SetProcessDpiAwarenessContext`, asking for
+        // PER_MONITOR_AWARE_V2 — so the UI stays crisp on scaled displays
+        // either way. Elevation is opt-in through the settings screen instead
+        // of a manifest flag.
         res.set("FileDescription", "ClamAV Antivirus Scanner GUI");
         res.set("ProductName", "ClamAV GUI");
         res.set("CompanyName", "ClamAV Open Source");
@@ -99,6 +121,25 @@ fn generate_yamagoya_manifest() {
 }
 
 /// 递归收集并压缩 embed 目录中的所有文件
+/// Format a byte count for the build log.
+///
+/// Integer kilobyte division used to turn any file smaller than 1 KB into a
+/// meaningless "0 KB -> 0 KB", which is exactly the size most of the YAMAGoya
+/// rules are.
+fn human_size(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+
+    let bytes_f = bytes as f64;
+    if bytes_f < KB {
+        format!("{} B", bytes)
+    } else if bytes_f < MB {
+        format!("{:.1} KB", bytes_f / KB)
+    } else {
+        format!("{:.1} MB", bytes_f / MB)
+    }
+}
+
 fn collect_and_compress_files(
     base: &std::path::Path,
     dir: &std::path::Path,
@@ -131,13 +172,15 @@ fn collect_and_compress_files(
                     std::fs::write(&compressed_path, &compressed)
                         .expect("Failed to write compressed file");
 
-                    let original_kb = raw_data.len() / 1024;
-                    let compressed_kb = compressed.len() / 1024;
+                    // Logged rather than emitted as `cargo:warning=`: these are
+                    // informational, and dressing them up as warnings buried the
+                    // real ones (and scaled with the number of rule files).
+                    // `cargo build -vv` still shows them.
                     println!(
-                        "cargo:warning=Compressed {}: {} KB -> {} KB ({:.0}%)",
+                        "Compressed {}: {} -> {} ({:.0}%)",
                         rel_str,
-                        original_kb,
-                        compressed_kb,
+                        human_size(raw_data.len()),
+                        human_size(compressed.len()),
                         compressed.len() as f64 / raw_data.len().max(1) as f64 * 100.0
                     );
 

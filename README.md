@@ -11,13 +11,19 @@
 
 ## 功能特性
 
-- **📊 仪表板** — 引擎状态、实时保护状态、病毒库信息一览
-- **🔍 文件扫描** — 选择文件/文件夹扫描，支持递归、压缩包、邮件、PDF、OLE2 等格式
-- **🛡 实时保护** — 自动监控下载、桌面、文档文件夹，检测新增和修改文件
-- **🔄 病毒库更新** — 一键调用 freshclam 在线更新病毒签名数据库
-- **🔒 隔离区** — 将检测到的威胁文件隔离管理
-- **⚙ 设置** — 扫描选项、排除规则、线程数、文件大小限制等可配置
-- **📋 日志** — 完整的扫描和操作日志记录
+- **📊 总览** — 引擎状态、威胁数量、实时保护状态、病毒库版本一览
+- **🔍 病毒扫描** — 快速/全盘/自定义目标（支持拖放），可选递归、压缩包、邮件、PDF、OLE2、HTML 与启发式告警
+- **🛡 实时保护** — 基于 Windows ETW 的文件与进程行为监控（YAMAGoya + Sigma/YAML/YARA 规则）
+- **🔄 病毒库更新** — 一键调用 freshclam 在线更新，可取消并实时显示下载进度
+- **🔒 隔离区** — 威胁文件隔离管理，支持筛选、单项恢复与删除
+- **⚙ 设置** — 扫描预设（快速/均衡/彻底）、正则排除规则、并发进程数与文件大小限制
+- **📋 日志** — 扫描 / 实时保护 / 更新三类日志，支持导出与复制
+
+### 界面风格
+
+采用「类纸风格」：暖白纸面与深色墨板两套配色、纸张纹理底纹、单色矢量图标，
+所有控件自绘以保持统一的印刷质感。界面跟随系统 DPI（PerMonitorV2），
+中文使用系统自带字体渲染。
 
 ## 下载安装
 
@@ -30,6 +36,7 @@
 ```
 ClamAV-GUI-Portable/
 ├── ClamAV-Scanner.exe      # GUI 主程序
+├── fonts/                   # 可选：随包分发的中文字体（.otf/.ttf/.ttc）
 ├── clamav/
 │   ├── clamscan.exe         # 扫描引擎
 │   ├── freshclam.exe        # 病毒库更新
@@ -41,8 +48,22 @@ ClamAV-GUI-Portable/
 │   ├── freshclam.conf       # 更新配置
 │   └── clamd.conf           # 守护进程配置
 ├── quarantine/              # 隔离区
-└── logs/                    # 日志
+├── logs/                    # 日志
+└── yamagoya/                # 实时保护引擎与规则
 ```
+
+### 权限说明
+
+程序以**当前用户权限**启动（`asInvoker`），不会在每次打开时弹出 UAC 提示——这样便携版在
+任何目录下都能直接双击运行。
+
+代价是：`C:\Windows` 下的部分受保护位置**无法读取，也无法把检出的文件移入隔离区**。
+需要处理这些位置时，请在 *设置 → 外观与启动* 中点击 **“以管理员身份重启”**，程序会通过
+系统的 `runas` 动词重新启动自己并请求提权。
+
+> 早期版本在清单里写死了 `requireAdministrator`，但同时又与工具链自带的清单冲突，
+> 结果是 GNU 构建根本不提权、而测试构建又要求提权导致 `cargo test` 无法运行。
+> 现在统一为按需提权。
 
 ## 技术栈
 
@@ -50,7 +71,7 @@ ClamAV-GUI-Portable/
 |------|------|
 | GUI | Rust + [egui](https://github.com/emilk/egui) 0.31 (GPU 加速即时模式渲染) |
 | 杀毒引擎 | [ClamAV](https://github.com/Cisco-Talos/clamav) 1.6.0 (C/Rust, 从源码编译) |
-| 编译器 | MSVC 14.x (Visual Studio 2022) |
+| 编译器 | MSVC 14.x (Visual Studio 2022)，亦支持 `x86_64-pc-windows-gnu` |
 | C 依赖 | OpenSSL, libcurl, libxml2, pcre2, zlib, bzip2, json-c (via vcpkg) |
 | CI/CD | GitHub Actions — 自动构建 + 发布 |
 
@@ -84,11 +105,7 @@ cmake --build . --config Release
 cmake --build . --config Release --target install
 cd ..
 
-# 4. 准备中文字体
-mkdir gui\fonts -Force
-Copy-Item "$env:SystemRoot\Fonts\msyh.ttc" "gui\fonts\NotoSansSC-Regular.ttf"
-
-# 5. 编译 GUI
+# 4. 编译 GUI
 $base = "$PWD\vcpkg_installed\x64-windows"
 $env:OPENSSL_DIR = $base
 $env:OPENSSL_LIB_DIR = "$base\lib"
@@ -96,6 +113,30 @@ $env:OPENSSL_INCLUDE_DIR = "$base\include"
 cd gui
 cargo build --release
 ```
+
+运行单元测试（覆盖命令行参数组装、`clamscan` 输出解析、配置迁移与路径/体积格式化）：
+
+```powershell
+cd gui
+cargo test
+```
+
+> **关于中文字体**
+>
+> 界面本身会直接使用 Windows 自带的中文字体（Microsoft YaHei 等），因此无需手动准备字体。
+> 如果目标机器缺少中文字体，可以把任意 `.otf` / `.ttf` / `.ttc` 字体放到可执行文件同级的
+> `fonts\` 目录，程序会优先使用它：
+>
+> ```
+> dist\ClamAV-GUI-Portable\
+>   ClamAV-Scanner.exe
+>   fonts\
+>     NotoSansSC-Regular.otf
+> ```
+>
+> 请**不要**把 `C:\Windows\Fonts` 下的字体（`msyh.ttc`、`simsun.ttc` 等）打包进发布包——
+> 它们是微软的专有字体，不允许再分发。需要随包分发时请使用 SIL Open Font License 的
+> [Noto Sans SC](https://github.com/notofonts/noto-cjk)。
 
 ## 许可证
 
