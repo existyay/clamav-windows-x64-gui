@@ -211,8 +211,25 @@ jobs:
           $zipUrl = "https://github.com/JPCERTCC/YAMAGoya/releases/download/v1.0.0/YAMAGoya.v1.0.0.x64.zip"
           $zipPath = "$yamaDir\yamagoya.zip"
 
-          Write-Host "Downloading YAMAGoya v1.0.0..."
-          Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
+          # This asset is ~75 MB from GitHub's release CDN. The default 100 second
+          # request timeout and the lack of a retry meant one slow or dropped
+          # transfer failed the whole build, half an hour in, with nothing to show
+          # for it.
+          $downloaded = $false
+          foreach ($attempt in 1..3) {
+            try {
+              Write-Host "Downloading YAMAGoya v1.0.0 (attempt $attempt)..."
+              Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 900
+              $downloaded = $true
+              break
+            } catch {
+              Write-Host "  attempt $attempt failed: $($_.Exception.Message)"
+              if ($attempt -lt 3) { Start-Sleep -Seconds (15 * $attempt) }
+            }
+          }
+          if (-not $downloaded) {
+            throw "无法下载 YAMAGoya（已重试 3 次）：$zipUrl"
+          }
 
           Write-Host "Extracting YAMAGoya..."
           Expand-Archive -Path $zipPath -DestinationPath "$yamaDir\tmp" -Force
@@ -239,7 +256,19 @@ jobs:
               "detect_wmi_activity.yml"
             )
             foreach ($f in $ruleFiles) {
-              Invoke-WebRequest -Uri "https://raw.githubusercontent.com/JPCERTCC/YAMAGoya/main/rules/$f" -OutFile "$yamaDir\rules\$f" -UseBasicParsing
+              $ruleUrl = "https://raw.githubusercontent.com/JPCERTCC/YAMAGoya/main/rules/$f"
+              $got = $false
+              foreach ($attempt in 1..3) {
+                try {
+                  Invoke-WebRequest -Uri $ruleUrl -OutFile "$yamaDir\rules\$f" -UseBasicParsing -TimeoutSec 120
+                  $got = $true
+                  break
+                } catch {
+                  Write-Host "  $f attempt $attempt failed: $($_.Exception.Message)"
+                  if ($attempt -lt 3) { Start-Sleep -Seconds (5 * $attempt) }
+                }
+              }
+              if (-not $got) { throw "无法下载规则文件：$ruleUrl" }
               Write-Host "Downloaded rule: $f"
             }
           }
