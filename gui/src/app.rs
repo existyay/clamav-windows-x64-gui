@@ -208,7 +208,7 @@ pub struct ClamAvApp {
     /// Set when the user really wants to exit, so the close handler stops
     /// diverting to the tray.
     quitting: bool,
-    /// The window is currently hidden in the tray.
+    /// Set while the window is retreated to the tray (minimised, not drawn).
     hidden: bool,
 }
 
@@ -512,12 +512,7 @@ impl ClamAvApp {
         };
 
         match action {
-            TrayAction::ShowWindow => {
-                self.hidden = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            }
+            TrayAction::ShowWindow => self.restore_from_tray(ctx),
             TrayAction::StopRealtime => {
                 if self.realtime.is_running() {
                     self.realtime.stop(&self.config);
@@ -545,9 +540,32 @@ impl ClamAvApp {
 
         if can_hide {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            self.hidden = true;
+            self.retreat_to_tray(ctx);
         }
+    }
+
+    /// Retreat to the tray after a close request.
+    ///
+    /// The window is **minimised**, never hidden. `ViewportCommand::Visible(false)`
+    /// looks tidier — no taskbar button, no Alt+Tab entry — but winit then spins
+    /// on the invisible window: measured on this build, `SW_HIDE` burned 9.66 s of
+    /// CPU in 10 s (97 % of a core) while `SW_MINIMIZE` used 0.000 s over the same
+    /// stretch, and the hidden window stopped running frames altogether (< 20
+    /// `update()` calls in 13 s), so the tray menu could not have been polled at
+    /// all. A minimised window stays cheap *and* responsive, and the taskbar
+    /// button it leaves behind is a second way back should the shell ever swallow
+    /// the tray icon.
+    fn retreat_to_tray(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        self.hidden = true;
+    }
+
+    /// Undo [`Self::retreat_to_tray`], e.g. from the tray menu.
+    fn restore_from_tray(&mut self, ctx: &egui::Context) {
+        self.hidden = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
@@ -2743,6 +2761,11 @@ impl eframe::App for ClamAvApp {
         self.updater.poll_messages(&self.config);
 
         self.handle_tray(ctx);
+        // Launching the executable again is the user asking to see this window,
+        // so a second copy signals us instead of starting its own.
+        if crate::take_wake_request() {
+            self.restore_from_tray(ctx);
+        }
         self.handle_close_request(ctx);
         self.handle_dropped_files(ctx);
         self.handle_auto_quarantine();
@@ -2759,9 +2782,10 @@ impl eframe::App for ClamAvApp {
             self.grain = None;
         }
 
-        // --- While hidden, skip layout and painting entirely --------------
-        // A tray menu click is only noticed when this loop runs, so it has to
-        // keep ticking; not drawing anything is what makes that affordable.
+        // --- While in the tray, skip layout and painting entirely ---------
+        // The window is only minimised, so this branch still runs: a tray menu
+        // click is noticed from here, and everything below is what would cost
+        // real CPU if it kept running behind a closed window.
         if self.hidden {
             let toast_expired = self
                 .toast
@@ -2770,6 +2794,9 @@ impl eframe::App for ClamAvApp {
             if toast_expired {
                 self.toast = None;
             }
+            // Safety net: poll the tray channel a few times a second even if a
+            // wake-up from the menu thread were ever dropped. A frame that
+            // reaches this point draws nothing, so it is nearly free.
             ctx.request_repaint_after(Duration::from_millis(120));
             return;
         }
@@ -2854,6 +2881,14 @@ impl eframe::App for ClamAvApp {
 impl ClamAvApp {
     /// Remember the window size so it can be persisted on exit.
     fn save_window_size(&mut self, ctx: &egui::Context) {
+        // While in the tray the window is minimised, so its "size" is the
+        // icon-sized rectangle Windows gives a minimised window and its
+        // maximised flag reads as false. Remembering either would reopen the app
+        // tiny — or un-maximised — on the next launch.
+        if self.hidden {
+            return;
+        }
+
         let (size, maximized) = ctx.input(|i| {
             let viewport = i.viewport();
             (viewport.inner_rect.map(|r| r.size()), viewport.maximized)

@@ -102,6 +102,72 @@ fn acquire_single_instance() -> InstanceGuard {
     InstanceGuard::Unavailable
 }
 
+/// Name of the event a second launch uses to ask the running copy to show itself.
+#[cfg(windows)]
+const WAKE_EVENT_NAME: &str = "ClamAV_GUI_ShowWindow_v1";
+
+/// Handle of that event, held by the instance that won the single-instance lock.
+#[cfg(windows)]
+static WAKE_EVENT: std::sync::atomic::AtomicPtr<std::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Create the (auto-reset, initially unsignalled) wake event.
+#[cfg(windows)]
+fn create_wake_event() -> *mut std::ffi::c_void {
+    use windows_sys::Win32::System::Threading::CreateEventW;
+
+    /// `CreateEventW`: not manual-reset, initially unsignalled.
+    const AUTO_RESET: i32 = 0;
+    const NOT_SIGNALLED: i32 = 0;
+
+    let name: Vec<u16> = WAKE_EVENT_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe { CreateEventW(std::ptr::null(), AUTO_RESET, NOT_SIGNALLED, name.as_ptr()) }
+}
+
+/// Ask the instance that holds the lock to bring its window back.
+///
+/// Without this a second launch left the user with a modal "already running"
+/// dialog and a second live process, while the window they actually wanted stayed
+/// minimised in the tray. The launch is the user's request to see the app, so it
+/// is treated as one.
+#[cfg(windows)]
+fn signal_running_instance() {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+
+    let name: Vec<u16> = WAKE_EVENT_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+    let handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
+    if !handle.is_null() {
+        unsafe {
+            SetEvent(handle);
+            CloseHandle(handle);
+        }
+    }
+}
+
+/// Consume a pending "show yourself" request, if the event exists.
+#[cfg(windows)]
+pub(crate) fn take_wake_request() -> bool {
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    /// `WAIT_OBJECT_0` from `Win32::System::Threading`.
+    const WAIT_OBJECT_0: u32 = 0;
+
+    let handle = WAKE_EVENT.load(std::sync::atomic::Ordering::SeqCst);
+    if handle.is_null() {
+        return false;
+    }
+
+    // Zero timeout: an auto-reset event clears itself once the wait succeeds, so
+    // a request that arrives while the window is visible is simply dropped.
+    unsafe { WaitForSingleObject(handle, 0) == WAIT_OBJECT_0 }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn take_wake_request() -> bool {
+    false
+}
+
 /// Install a panic hook that leaves a trace and tells the user.
 ///
 /// The binary is built with `windows_subsystem = "windows"`, so a panic would
@@ -160,26 +226,21 @@ fn install_panic_hook() {
     }));
 }
 
+/// Let the running instance raise its window.
+///
+/// A process may only steal the foreground if it is *given* the right, and the
+/// freshly launched copy is the one Windows currently grants it to. Handing it
+/// over means the other instance's `Focus` restores the window properly instead
+/// of merely flashing its taskbar button.
 #[cfg(windows)]
-fn show_already_running_message() {
-    use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, MB_ICONINFORMATION, MB_OK,
-    };
+fn allow_running_instance_to_raise_itself() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 
-    let text: Vec<u16> = "ClamAV 安全中心 已在运行中。\n请查看系统托盘图标。\0"
-        .encode_utf16()
-        .collect();
-    let caption: Vec<u16> = "ClamAV 安全中心\0".encode_utf16().collect();
+    /// `ASFW_ANY` from `Win32::UI::WindowsAndMessaging`, spelled out so the extra
+    /// windows-sys feature is not needed for one constant.
+    const ASFW_ANY: u32 = u32::MAX;
 
-    unsafe {
-        MessageBoxW(
-            0 as HWND,
-            text.as_ptr(),
-            caption.as_ptr(),
-            MB_OK | MB_ICONINFORMATION,
-        );
-    }
+    unsafe { AllowSetForegroundWindow(ASFW_ANY) };
 }
 
 /// Whether this process already holds administrator rights.
@@ -309,9 +370,15 @@ fn main() -> eframe::Result<()> {
     match acquire_single_instance() {
         InstanceGuard::Acquired(handle) => {
             INSTANCE_HANDLE.store(handle, std::sync::atomic::Ordering::SeqCst);
+            // The event a later launch signals to ask for the window back.
+            WAKE_EVENT.store(create_wake_event(), std::sync::atomic::Ordering::SeqCst);
         }
         InstanceGuard::AlreadyRunning => {
-            show_already_running_message();
+            // This launch is the user asking to see the app, so hand it over
+            // rather than rejecting it: the copy that owns the lock brings its
+            // window back and this one exits straight away.
+            allow_running_instance_to_raise_itself();
+            signal_running_instance();
             return Ok(());
         }
         InstanceGuard::Unavailable => {}
@@ -401,5 +468,42 @@ mod instance_tests {
         );
 
         release_single_instance();
+    }
+
+    /// The event that turns a second launch into "show the window" must be
+    /// reachable by name: the launching copy only ever opens it by name, never
+    /// by handle, so a typo or a `#[cfg]` mismatch would silently do nothing.
+    #[test]
+    fn a_second_launch_is_able_to_wake_the_running_copy() {
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+
+        let handle = create_wake_event();
+        assert!(!handle.is_null(), "the wake event could not be created");
+
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            // A real instance is running and owns this event; leave it alone.
+            unsafe { CloseHandle(handle) };
+            eprintln!("skipping: a running instance owns the wake event");
+            return;
+        }
+
+        WAKE_EVENT.store(handle, Ordering::SeqCst);
+
+        // Nothing has asked for the window yet.
+        assert!(!take_wake_request(), "spurious wake-up");
+
+        signal_running_instance();
+        assert!(
+            take_wake_request(),
+            "the running copy was not woken by a second launch"
+        );
+
+        // Auto-reset: one launch is one request.
+        assert!(!take_wake_request(), "the request was not consumed");
+
+        let handle = WAKE_EVENT.swap(std::ptr::null_mut(), Ordering::SeqCst);
+        if !handle.is_null() {
+            unsafe { CloseHandle(handle) };
+        }
     }
 }
