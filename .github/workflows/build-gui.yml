@@ -515,9 +515,24 @@ jobs:
 
       - name: Move the rolling tag
         if: github.event_name != 'pull_request' && github.event.inputs.create_release != 'false'
+        # Best effort on purpose. Moving the tag is cosmetic: the release below is
+        # identified by the fixed tag name, and the permanent download URLs go
+        # through /releases/latest, which resolves by release date rather than by
+        # tag. Run #38 failed on this step and skipped the release entirely after
+        # half an hour of building, so a rejected tag push is now reported as a
+        # warning instead of blocking publication. The release action creates the
+        # tag at this commit when it is missing.
+        continue-on-error: true
         run: |
+          Write-Host "remote: $(git remote get-url origin)"
+          Write-Host "local tags: $(git tag --list | Select-Object -First 20)"
           git tag -f $env:RELEASE_TAG
           git push --force origin $env:RELEASE_TAG
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::无法推送标签 $env:RELEASE_TAG，改由发布步骤创建（不影响下载）"
+          } else {
+            Write-Host "Tag $env:RELEASE_TAG now points at $(git rev-parse HEAD)"
+          }
         shell: pwsh
 
       - name: Publish the rolling release
