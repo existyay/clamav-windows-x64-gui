@@ -5,6 +5,12 @@ concurrency:
   cancel-in-progress: true
 
 on:
+  # Every commit on main builds a full artifact set. A newer commit cancels the
+  # older run (see `concurrency` above), and the publish job below refuses to
+  # upload anything that is no longer the tip of main — so the release always
+  # describes the newest commit, and there is never more than one release.
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       create_release:
@@ -31,6 +37,9 @@ env:
 jobs:
   build:
     runs-on: windows-latest
+    # ~8 minutes with a warm ClamAV cache, ~40 from scratch. The limit only
+    # exists so a hung download cannot occupy a runner forever.
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -147,7 +156,15 @@ jobs:
         run: |
           Write-Host "Using cached build/install (skipping CMake configure+build)."
 
+      - name: Cache the bundled CJK font
+        id: font_cache
+        uses: actions/cache@v4
+        with:
+          path: gui/fonts
+          key: noto-sans-sc-regular-otf-v1
+
       - name: Stage the CJK font
+        if: steps.font_cache.outputs.cache-hit != 'true'
         continue-on-error: true
         run: |
           New-Item -ItemType Directory -Path gui\fonts -Force | Out-Null
@@ -200,7 +217,18 @@ jobs:
           Get-ChildItem $embedDir | Format-Table Name, Length -AutoSize
         shell: pwsh
 
+      - name: Cache the embedded YAMAGoya
+        id: yamagoya_cache
+        uses: actions/cache@v4
+        with:
+          # 75 MB of third-party binaries pinned to one upstream version. Every
+          # commit now builds, so re-downloading this each time was both slow and
+          # the most likely way for a build to fail on a bad connection.
+          path: gui/embed/yamagoya
+          key: yamagoya-v1.0.0-x64-rules-1
+
       - name: Download and embed YAMAGoya
+        if: steps.yamagoya_cache.outputs.cache-hit != 'true'
         run: |
           $yamaDir = "gui\embed\yamagoya"
           New-Item -ItemType Directory -Path $yamaDir -Force | Out-Null
@@ -417,12 +445,15 @@ jobs:
         with:
           name: ClamAV-GUI-Portable-x64-${{ steps.version.outputs.version }}
           path: dist/ClamAV-GUI-Portable-x64.zip
+          # Every commit builds, so keep the per-run artifacts from piling up.
+          retention-days: 7
 
       - name: Upload standalone artifact
         uses: actions/upload-artifact@v4
         with:
           name: ClamAV-Scanner-Standalone-x64-${{ steps.version.outputs.version }}
           path: dist/ClamAV-Scanner-Standalone-x64.exe
+          retention-days: 7
 
   # Publishing is a separate job so the write-capable token is never available
   # to the build tooling above.
@@ -433,6 +464,29 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Only the newest commit may publish. Without this gate a slow build for an
+      # older commit could finish after a newer one and overwrite the release with
+      # stale artifacts — the exact opposite of "always keep the latest".
+      - name: Still the tip of main?
+        id: tip
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $head = gh api "repos/$env:GITHUB_REPOSITORY/commits/main" --jq .sha
+          if ($LASTEXITCODE -ne 0 -or -not $head) {
+            # A failed lookup must never silently suppress a release.
+            Write-Host "::warning::无法确认 main 的最新提交，按最新处理"
+            echo "fresh=true" >> $env:GITHUB_OUTPUT
+          } elseif ($head.Trim() -ne $env:GITHUB_SHA) {
+            Write-Host "::warning::$env:GITHUB_SHA 已不是 main 的最新提交（$($head.Trim())），跳过发布，由更新的构建覆盖"
+            echo "fresh=false" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "Publishing $env:GITHUB_SHA (tip of main)"
+            echo "fresh=true" >> $env:GITHUB_OUTPUT
+          }
+        shell: pwsh
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -466,7 +520,7 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Prune every other tag and release
-        if: github.event_name != 'pull_request' && github.event.inputs.create_release != 'false'
+        if: github.event_name != 'pull_request' && github.event.inputs.create_release != 'false' && steps.tip.outputs.fresh != 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -499,7 +553,7 @@ jobs:
         shell: pwsh
 
       - name: Drop the previous release for this tag
-        if: github.event_name != 'pull_request' && github.event.inputs.create_release != 'false'
+        if: github.event_name != 'pull_request' && github.event.inputs.create_release != 'false' && steps.tip.outputs.fresh != 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -514,7 +568,7 @@ jobs:
         continue-on-error: true
 
       - name: Move the rolling tag
-        if: github.event_name != 'pull_request' && github.event.inputs.create_release != 'false'
+        if: github.event_name != 'pull_request' && github.event.inputs.create_release != 'false' && steps.tip.outputs.fresh != 'false'
         # Best effort on purpose. Moving the tag is cosmetic: the release below is
         # identified by the fixed tag name, and the permanent download URLs go
         # through /releases/latest, which resolves by release date rather than by
@@ -536,7 +590,7 @@ jobs:
         shell: pwsh
 
       - name: Publish the rolling release
-        if: github.event_name != 'pull_request' && (github.event.inputs.create_release == 'true' || github.event.inputs.create_release == '')
+        if: github.event_name != 'pull_request' && (github.event.inputs.create_release == 'true' || github.event.inputs.create_release == '') && steps.tip.outputs.fresh != 'false'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
