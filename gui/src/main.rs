@@ -174,6 +174,178 @@ pub(crate) fn take_wake_request() -> bool {
     false
 }
 
+/// Parent process of this process, as `(pid, image name)`.
+///
+/// Recorded in the launch log because "it opened by itself again" is only
+/// answerable if the log says *who started it*: `explorer.exe` is the user
+/// double-clicking, `powershell.exe`/`cmd.exe` is a script, `taskeng.exe` or
+/// `svchost.exe` would be a scheduled task. A toolhelp snapshot is the only
+/// dependency-free way to read that.
+#[cfg(windows)]
+fn parent_process() -> Option<(u32, String)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let name_of = |raw: &[u16; 260]| -> String {
+        let end = raw.iter().position(|c| *c == 0).unwrap_or(raw.len());
+        String::from_utf16_lossy(&raw[..end])
+    };
+
+    // SAFETY: standard toolhelp enumeration. The snapshot handle is checked
+    // against `INVALID_HANDLE_VALUE` and closed in every path below, and the
+    // entry buffer is a plain `PROCESSENTRY32W` whose `dwSize` the API requires
+    // to be set before the first call.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE || snapshot.is_null() {
+            return None;
+        }
+
+        let mut rows: Vec<(u32, u32, String)> = Vec::new();
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                rows.push((
+                    entry.th32ProcessID,
+                    entry.th32ParentProcessID,
+                    name_of(&entry.szExeFile),
+                ));
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+
+        let me = std::process::id();
+        let parent_pid = rows
+            .iter()
+            .find(|(pid, _, _)| *pid == me)
+            .map(|(_, parent, _)| *parent)
+            .filter(|parent| *parent != 0 && *parent != me)?;
+        let parent_name = rows
+            .iter()
+            .find(|(pid, _, _)| *pid == parent_pid)
+            .map(|(_, _, name)| name.clone())
+            .unwrap_or_default();
+        Some((parent_pid, parent_name))
+    }
+}
+
+#[cfg(not(windows))]
+fn parent_process() -> Option<(u32, String)> {
+    None
+}
+
+/// Append one line to `logs\launch.log` describing what this launch decided.
+///
+/// The app has no other record of how often, when and by whom it was started, so
+/// a report of "it keeps opening by itself" could not be checked against
+/// anything. Each line carries the timestamp, this process id, the parent
+/// process, the decision and the executable that was started. Best effort
+/// throughout: diagnostics must never be able to break startup.
+pub(crate) fn log_launch(decision: &str, detail: &str) {
+    let path = config::base_dir().join("logs").join("launch.log");
+
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+
+    // Keep the file bounded; it is a diagnostic, not an audit trail.
+    const MAX_BYTES: u64 = 256 * 1024;
+    if std::fs::metadata(&path)
+        .map(|meta| meta.len() > MAX_BYTES)
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_file(&path);
+    }
+
+    let mut fields = format!("decision={decision} pid={}", std::process::id());
+    if let Some((parent_pid, parent_name)) = parent_process() {
+        fields.push_str(&format!(" ppid={parent_pid} parent={parent_name}"));
+    }
+    if !detail.is_empty() {
+        fields.push(' ');
+        fields.push_str(detail);
+    }
+
+    let exe = std::env::current_exe()
+        .map(|path| config::display_path(&path))
+        .unwrap_or_else(|_| "?".to_string());
+    let line = format!(
+        "{} {} exe={}\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+        fields,
+        exe
+    );
+
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()));
+}
+
+/// Outcome of the lock-file fallback used when the named mutex cannot exist.
+#[cfg(windows)]
+enum LockFileOutcome {
+    /// We hold it. The file must stay open for the process lifetime, which is
+    /// what makes the sharing violation below happen for everyone else.
+    Acquired(std::fs::File),
+    /// Another process already holds it.
+    Held,
+    /// The lock could not be created for some other reason (a read-only account
+    /// directory, for instance), so there is no guard at all.
+    Unavailable(String),
+}
+
+/// Hold `%APPDATA%\ClamAV GUI\instance.lock` open exclusively.
+///
+/// `CreateMutexW` is the primary guard, but it can fail to return a handle at
+/// all in unusual security contexts. Startup used to continue in that case,
+/// which meant *every* launch became its own instance — precisely the "it opened
+/// twice again" symptom. `share_mode(0)` is the Windows way of saying "nobody
+/// else may open this file", so the second copy gets `ERROR_SHARING_VIOLATION`.
+#[cfg(windows)]
+fn acquire_fallback_lock() -> LockFileOutcome {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    /// `ERROR_SHARING_VIOLATION`, i.e. somebody holds the file.
+    const SHARING_VIOLATION: i32 = 32;
+
+    let Some(path) = config::AppConfig::fallback_config_path()
+        .map(|config| config.with_file_name("instance.lock"))
+    else {
+        return LockFileOutcome::Unavailable("没有可用的用户目录".to_string());
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(&path);
+
+    match opened {
+        Ok(file) => LockFileOutcome::Acquired(file),
+        Err(err) if err.raw_os_error() == Some(SHARING_VIOLATION) => LockFileOutcome::Held,
+        Err(err) => LockFileOutcome::Unavailable(err.to_string()),
+    }
+}
+
+/// Keeps the fallback lock file open for the whole process lifetime.
+#[cfg(windows)]
+static FALLBACK_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+
 /// Install a panic hook that leaves a trace and tells the user.
 ///
 /// The binary is built with `windows_subsystem = "windows"`, so a panic would
@@ -374,16 +546,39 @@ fn main() -> eframe::Result<()> {
             INSTANCE_HANDLE.store(handle, std::sync::atomic::Ordering::SeqCst);
             // The event a later launch signals to ask for the window back.
             WAKE_EVENT.store(create_wake_event(), std::sync::atomic::Ordering::SeqCst);
+            log_launch("owned", "");
         }
         InstanceGuard::AlreadyRunning => {
             // This launch is the user asking to see the app, so hand it over
             // rather than rejecting it: the copy that owns the lock brings its
-            // window back and this one exits straight away.
+            // window back and this one exits straight away. The log line records
+            // who asked, which is the whole point of the exercise — a reader can
+            // tell a double-click (`parent=explorer.exe`) from a script.
             allow_running_instance_to_raise_itself();
             signal_running_instance();
+            log_launch("woken-existing", "");
             return Ok(());
         }
-        InstanceGuard::Unavailable => {}
+        InstanceGuard::Unavailable => {
+            // No mutex: fall back to the lock file instead of starting unguarded.
+            // Silently starting unguarded is what lets one launch turn into many.
+            match acquire_fallback_lock() {
+                LockFileOutcome::Acquired(file) => {
+                    let _ = FALLBACK_LOCK.set(file);
+                    WAKE_EVENT.store(create_wake_event(), std::sync::atomic::Ordering::SeqCst);
+                    log_launch("owned-fallback", "named mutex unavailable");
+                }
+                LockFileOutcome::Held => {
+                    allow_running_instance_to_raise_itself();
+                    signal_running_instance();
+                    log_launch("woken-existing", "named mutex unavailable, lock file held");
+                    return Ok(());
+                }
+                LockFileOutcome::Unavailable(reason) => {
+                    log_launch("owned-unguarded", &format!("no guard available: {reason}"));
+                }
+            }
+        }
     }
 
     // Settings are read before the window exists so the remembered geometry can
@@ -470,6 +665,23 @@ mod instance_tests {
         );
 
         release_single_instance();
+    }
+
+    /// The lock-file fallback exists for the case where the named mutex cannot
+    /// be created at all. A fallback that admits two copies would defeat the
+    /// point, so it has to be exclusive in the same way.
+    #[test]
+    fn the_fallback_lock_is_exclusive() {
+        let LockFileOutcome::Acquired(_held) = acquire_fallback_lock() else {
+            // Somebody else holds it right now, which is itself proof that the
+            // lock works. (A real instance uses the mutex, not this file.)
+            return;
+        };
+
+        assert!(
+            matches!(acquire_fallback_lock(), LockFileOutcome::Held),
+            "a second holder of the fallback lock should have been turned away"
+        );
     }
 
     /// The event that turns a second launch into "show the window" must be

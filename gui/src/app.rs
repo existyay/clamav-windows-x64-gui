@@ -2827,6 +2827,9 @@ impl eframe::App for ClamAvApp {
         // Launching the executable again is the user asking to see this window,
         // so a second copy signals us instead of starting its own.
         if crate::take_wake_request() {
+            // Paired with the launcher's own line in the same log: one says who
+            // started a second copy, this one says it was acted on.
+            crate::log_launch("woke", "another launch asked for the window");
             self.restore_from_tray(ctx);
         }
         self.handle_close_request(ctx);
