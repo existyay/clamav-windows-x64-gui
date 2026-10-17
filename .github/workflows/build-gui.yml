@@ -13,8 +13,13 @@ on:
         default: true
         type: boolean
 
+# The build job runs third-party tooling -- vcpkg ports, CMake, and a YAMAGoya
+# archive downloaded from the internet -- so it must not hold a token that can
+# write to the repository. Publishing needs write access, and is therefore
+# confined to the 'publish' job below, which only runs GitHub's own actions
+# and PowerShell.
 permissions:
-  contents: write
+  contents: read
 
 env:
   # The project publishes exactly one release, under this single tag. Every run
@@ -390,6 +395,47 @@ jobs:
           name: ClamAV-Scanner-Standalone-x64-${{ steps.version.outputs.version }}
           path: dist/ClamAV-Scanner-Standalone-x64.exe
 
+  # Publishing is a separate job so the write-capable token is never available
+  # to the build tooling above.
+  publish:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The rolling tag is force-pushed from here, so git needs a credential
+          # (the build job's checkout deliberately has none).
+          fetch-depth: 0
+
+      - name: Read version
+        id: version
+        run: |
+          # Repeated from the build job on purpose: it is three lines, and this
+          # way the publish job does not depend on an output crossing a job
+          # boundary.
+          $cargoToml = Get-Content "gui\Cargo.toml" -Raw
+          if ($cargoToml -match 'version = "([^"]+)"') {
+            $version = $matches[1]
+          } else {
+            $version = "0.0.0"
+          }
+
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "build=$env:GITHUB_RUN_NUMBER" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+      - name: Download the packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          # Both artifacts are unrolled flat into dist/, which is where the
+          # release step below expects to find them.
+          pattern: ClamAV-*
+          path: dist
+          merge-multiple: true
       - name: Prune every other tag and release
         if: github.event_name != 'pull_request' && github.event.inputs.create_release != 'false'
         env:
@@ -508,6 +554,18 @@ jobs:
             - 退出时后台实时保护可能来不及停止
             - 旧版配置文件会丢失 YAMAGoya 路径
             - 程序此前总是请求管理员权限，且该请求与工具链自带清单冲突；现在改为按需提权
+            - 「扫描后自动隔离」此前默认开启：扫描一结束就把全部检出文件移入隔离区，
+              连启发式误报也不会过问；现在默认关闭，需要时可在「设置」中开启
+            - 隔离区单项删除此前单击即永久删除；现在与「清空隔离区」一样需要二次确认
+            - 恢复隔离文件时，若原位置已存在同名文件（例如用户重新下载了同名程序），
+              此前会被静默覆盖；现在会拒绝恢复并提示先移走该文件
+            - 停止实时保护时，若无法读取进程映像，此前会退回到 pid 文件里记录的字符串
+              来判断身份（该文件可被改写）；现在直接拒绝终止，不再误杀其它进程
+            - 配置写盘不再先删除旧文件：此前若在删除与重命名之间崩溃或重命名失败，
+              用户的全部设置会丢失
+            - 每次提交都会自动运行格式检查 / clippy（警告即错误）/ 单元测试；
+              发布工作流中编译、下载第三方依赖的构建任务改为只读令牌，仓库写权限
+              仅保留给最后的发布任务
 
             ### 📝 使用说明
             1. 解压到任意目录

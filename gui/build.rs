@@ -29,7 +29,10 @@ fn main() {
         res.set("FileDescription", "ClamAV Antivirus Scanner GUI");
         res.set("ProductName", "ClamAV GUI");
         res.set("CompanyName", "ClamAV Open Source");
-        res.set("LegalCopyright", "Copyright (C) 2024-2026 ClamAV GUI Contributors");
+        res.set(
+            "LegalCopyright",
+            "Copyright (C) 2024-2026 ClamAV GUI Contributors",
+        );
         res.set("OriginalFilename", "clamav-gui.exe");
         res.set("InternalName", "clamav-gui");
         if let Err(e) = res.compile() {
@@ -120,7 +123,6 @@ fn generate_yamagoya_manifest() {
     std::fs::write(&manifest_path, code).expect("Failed to write yamagoya manifest");
 }
 
-/// 递归收集并压缩 embed 目录中的所有文件
 /// Format a byte count for the build log.
 ///
 /// Integer kilobyte division used to turn any file smaller than 1 KB into a
@@ -140,13 +142,16 @@ fn human_size(bytes: usize) -> String {
     }
 }
 
+/// 递归收集并压缩 embed 目录中的所有文件。
 fn collect_and_compress_files(
     base: &std::path::Path,
     dir: &std::path::Path,
     compressed_dir: &std::path::Path,
     entries: &mut Vec<(String, String)>,
 ) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.is_dir() {
@@ -185,14 +190,14 @@ fn collect_and_compress_files(
                     );
 
                     if let Ok(abs_path) = std::fs::canonicalize(&compressed_path) {
-                        let abs_str = abs_path.to_string_lossy().to_string();
-                        let abs_str = if abs_str.starts_with(r"\\?\") {
-                            abs_str[4..].to_string()
-                        } else {
-                            abs_str
-                        };
-                        let abs_str = abs_str.replace('\\', "/");
-                        entries.push((rel_str, abs_str));
+                        // `canonicalize` yields a `\\?\C:\...` verbatim path on
+                        // Windows. `include_bytes!` accepts either form, but the
+                        // generated manifest is easier to read without the prefix.
+                        let abs_str = abs_path.to_string_lossy();
+                        let trimmed = abs_str
+                            .strip_prefix(r"\\?\")
+                            .unwrap_or_else(|| abs_str.as_ref());
+                        entries.push((rel_str, trimmed.replace('\\', "/")));
                     }
                 }
             }

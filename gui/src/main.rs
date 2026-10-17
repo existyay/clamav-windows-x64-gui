@@ -1,16 +1,16 @@
 #![windows_subsystem = "windows"]
 
-mod scanner;
-mod updater;
-mod realtime;
 mod app;
 mod bootstrap;
-mod theme;
-mod widgets;
-mod icons;
 mod config;
 mod embedded;
+mod icons;
+mod realtime;
+mod scanner;
+mod theme;
 mod tray;
+mod updater;
+mod widgets;
 
 use eframe::egui;
 
@@ -120,7 +120,10 @@ fn create_wake_event() -> *mut std::ffi::c_void {
     const AUTO_RESET: i32 = 0;
     const NOT_SIGNALLED: i32 = 0;
 
-    let name: Vec<u16> = WAKE_EVENT_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+    let name: Vec<u16> = WAKE_EVENT_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     unsafe { CreateEventW(std::ptr::null(), AUTO_RESET, NOT_SIGNALLED, name.as_ptr()) }
 }
 
@@ -135,7 +138,10 @@ fn signal_running_instance() {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
 
-    let name: Vec<u16> = WAKE_EVENT_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+    let name: Vec<u16> = WAKE_EVENT_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
     if !handle.is_null() {
         unsafe {
@@ -206,9 +212,7 @@ fn install_panic_hook() {
         #[cfg(windows)]
         {
             use windows_sys::Win32::Foundation::HWND;
-            use windows_sys::Win32::UI::WindowsAndMessaging::{
-                MessageBoxW, MB_ICONERROR, MB_OK,
-            };
+            use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
             let text: Vec<u16> = short.encode_utf16().chain(std::iter::once(0)).collect();
             let caption: Vec<u16> = "ClamAV 安全中心\0".encode_utf16().collect();
@@ -276,9 +280,7 @@ fn query_elevation() -> bool {
             return false;
         }
 
-        let mut elevation = TOKEN_ELEVATION {
-            TokenIsElevated: 0,
-        };
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
         let mut returned = 0u32;
         let ok = GetTokenInformation(
             token,

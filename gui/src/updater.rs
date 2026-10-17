@@ -176,8 +176,7 @@ impl DatabaseUpdater {
             push_bounded(&mut self.log_lines, message.clone());
 
             if success {
-                self.last_update =
-                    Some(chrono::Local::now().format("%Y-%m-%d %H:%M").to_string());
+                self.last_update = Some(chrono::Local::now().format("%Y-%m-%d %H:%M").to_string());
                 // Re-read the freshly written database instead of guessing.
                 self.apply_env(&crate::bootstrap::probe_database(&config.database_dir));
             } else {

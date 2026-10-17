@@ -302,8 +302,7 @@ const FONT_EXTENSIONS: [&str; 3] = ["ttf", "otf", "ttc"];
 fn install_fonts(ctx: &egui::Context) {
     // Reading a multi-megabyte font file is not something to repeat on every
     // theme toggle, so this only ever runs once per process.
-    static INSTALLED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    static INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if INSTALLED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
@@ -316,7 +315,9 @@ fn install_fonts(ctx: &egui::Context) {
             index,
             ..egui::FontData::from_owned(bytes)
         };
-        fonts.font_data.insert(name.clone(), std::sync::Arc::new(data));
+        fonts
+            .font_data
+            .insert(name.clone(), std::sync::Arc::new(data));
 
         // Appended rather than prepended: Latin text keeps egui's own hinted
         // face (which is better at small sizes), and CJK falls through to ours.
@@ -342,7 +343,7 @@ fn find_cjk_font() -> Option<(String, u32, Vec<u8>)> {
             .unwrap_or_else(|_| std::path::PathBuf::from("C:\\Windows\\Fonts"));
 
         for name in [
-            "msyh.ttc",   // Microsoft YaHei (Simplified Chinese)
+            "msyh.ttc", // Microsoft YaHei (Simplified Chinese)
             "msyh.ttf",
             "msyhbd.ttc",
             "Deng.ttf",   // DengXian
@@ -438,7 +439,11 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
     .into();
 
     // Visuals ------------------------------------------------------------
-    let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+    let mut v = if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
 
     v.dark_mode = dark;
     v.override_text_color = None;
@@ -573,8 +578,7 @@ pub fn grain_texture(ctx: &egui::Context) -> egui::TextureHandle {
 
             // High-frequency speckle on top of the fibre.
             let speckle = {
-                let mut h = (x as u64)
-                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                let mut h = (x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
                     ^ (y as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
                 h ^= h >> 29;
                 h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -622,7 +626,8 @@ pub fn paint_grain(
         texture.id(),
         rect,
         uv,
-        pal.grain_tint.gamma_multiply(pal.grain_alpha as f32 / 255.0),
+        pal.grain_tint
+            .gamma_multiply(pal.grain_alpha as f32 / 255.0),
     );
 }
 
@@ -716,7 +721,12 @@ mod tests {
         }
 
         // Accent buttons carry their own foreground and must stay readable.
-        assert_legible(&format!("{name}: on_accent"), pal.on_accent, pal.accent, 4.5);
+        assert_legible(
+            &format!("{name}: on_accent"),
+            pal.on_accent,
+            pal.accent,
+            4.5,
+        );
         assert_legible(
             &format!("{name}: danger surface"),
             pal.danger,
@@ -730,12 +740,7 @@ mod tests {
             ("success", pal.success),
             ("warning", pal.warning),
         ] {
-            assert_legible(
-                &format!("{name}: {label} on paper"),
-                color,
-                pal.paper,
-                4.5,
-            );
+            assert_legible(&format!("{name}: {label} on paper"), color, pal.paper, 4.5);
         }
     }
 

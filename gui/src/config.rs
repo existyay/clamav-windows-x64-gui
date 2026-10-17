@@ -209,7 +209,12 @@ impl Default for AppConfig {
             exclude_patterns: default_exclude_patterns(),
 
             auto_update: true,
-            auto_quarantine: true,
+            // Off by default. Automatic quarantining moves files the user never
+            // picked, and ClamAV's heuristic alerts make false positives routine,
+            // so a single bad match could take away a working program with no
+            // prompt. The scan page still offers "隔离全部" behind an explicit
+            // click, and anyone who wants the automatic path can switch it on.
+            auto_quarantine: false,
             persist_realtime_on_exit: false,
             close_to_tray: true,
             dark_mode: false,
@@ -309,14 +314,8 @@ impl AppConfig {
             self.yamagoya_rule_type = "sigma".to_string();
         }
 
-        self.window.width = self
-            .window
-            .width
-            .clamp(MIN_WINDOW_W, 16_384.0);
-        self.window.height = self
-            .window
-            .height
-            .clamp(MIN_WINDOW_H, 16_384.0);
+        self.window.width = self.window.width.clamp(MIN_WINDOW_W, 16_384.0);
+        self.window.height = self.window.height.clamp(MIN_WINDOW_H, 16_384.0);
 
         // Repair exclusion patterns that earlier versions shipped broken.
         for pattern in &mut self.exclude_patterns {
@@ -406,6 +405,11 @@ impl AppConfig {
 }
 
 /// Write a file by way of a temporary sibling plus a rename.
+///
+/// The rename replaces the destination in a single step, so there is never a
+/// moment where the file does not exist. Deleting the old copy first — as this
+/// used to do — meant that a crash, or a rename that failed afterwards, lost the
+/// user's settings outright.
 fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     let file_name = path
         .file_name()
@@ -415,9 +419,6 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 
     std::fs::write(&tmp, contents)?;
 
-    if path.exists() {
-        let _ = std::fs::remove_file(path);
-    }
     match std::fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -447,10 +448,12 @@ mod tests {
     fn empty_paths_fall_back_to_the_defaults() {
         // A config written by an older version deserialised `PathBuf` fields as
         // empty strings, which produced a GUI that could not find its engine.
-        let mut config = AppConfig::default();
-        config.clamav_dir = PathBuf::new();
-        config.log_dir = PathBuf::new();
-        config.quarantine_dir = PathBuf::new();
+        let config = AppConfig {
+            clamav_dir: PathBuf::new(),
+            log_dir: PathBuf::new(),
+            quarantine_dir: PathBuf::new(),
+            ..AppConfig::default()
+        };
 
         let fixed = config.normalized();
 
@@ -461,19 +464,24 @@ mod tests {
 
     #[test]
     fn legacy_broken_exclusions_are_repaired_in_place() {
-        let mut config = AppConfig::default();
-        config.exclude_patterns = vec![
-            r"target\debug".to_string(),
-            r"target\release".to_string(),
-            r"C:\Windows\WinSxS".to_string(),
-            r"my own pattern".to_string(),
-        ];
+        let config = AppConfig {
+            exclude_patterns: vec![
+                r"target\debug".to_string(),
+                r"target\release".to_string(),
+                r"C:\Windows\WinSxS".to_string(),
+                r"my own pattern".to_string(),
+            ],
+            ..AppConfig::default()
+        };
 
         let fixed = config.normalized();
 
         // The dead regexes are gone...
         assert!(!fixed.exclude_patterns.iter().any(|p| p == r"target\debug"));
-        assert!(!fixed.exclude_patterns.iter().any(|p| p == r"target\release"));
+        assert!(!fixed
+            .exclude_patterns
+            .iter()
+            .any(|p| p == r"target\release"));
         // ...and replaced with anchored forms.
         assert!(fixed
             .exclude_patterns
@@ -493,8 +501,10 @@ mod tests {
     #[test]
     fn a_custom_exclusion_list_is_left_alone() {
         let expected = vec![r"[\\/]node_modules[\\/]?$".to_string()];
-        let mut config = AppConfig::default();
-        config.exclude_patterns = expected.clone();
+        let config = AppConfig {
+            exclude_patterns: expected.clone(),
+            ..AppConfig::default()
+        };
 
         let fixed = config.normalized();
 
@@ -550,7 +560,9 @@ mod tests {
     fn developer_exclusions_target_build_output_only() {
         let dev = developer_exclusions();
         assert!(dev.iter().any(|p| p.contains("node_modules")));
-        assert!(dev.iter().any(|p| p.contains(r"target[\\/](debug|release)")));
+        assert!(dev
+            .iter()
+            .any(|p| p.contains(r"target[\\/](debug|release)")));
         for pattern in &dev {
             assert!(pattern.ends_with('$'), "{pattern} should be anchored");
         }
@@ -564,7 +576,10 @@ mod tests {
         thorough.apply_thorough_scan_preset();
 
         assert!(fast.max_file_size_mb <= thorough.max_file_size_mb);
-        assert!(!fast.scan_archives, "a quick scan should not unpack archives");
+        assert!(
+            !fast.scan_archives,
+            "a quick scan should not unpack archives"
+        );
         assert!(thorough.scan_archives);
     }
 }

@@ -276,9 +276,7 @@ fn button_colors(
 
     match kind {
         Btn::Primary => {
-            let fill = if pressed {
-                pal.accent_strong
-            } else if hovered {
+            let fill = if pressed || hovered {
                 pal.accent_strong
             } else {
                 pal.accent
@@ -318,7 +316,11 @@ fn button_colors(
             } else {
                 pal.card
             };
-            (Some(fill), Some(pal.danger.gamma_multiply(0.55)), pal.danger)
+            (
+                Some(fill),
+                Some(pal.danger.gamma_multiply(0.55)),
+                pal.danger,
+            )
         }
     }
 }
@@ -343,14 +345,18 @@ pub fn button(
     let icon_w = if icon.is_some() { icon_size } else { 0.0 };
     let pad_x = if kind == Btn::Quiet { 9.0 } else { 14.0 };
 
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), theme::font(13.5), Color32::PLACEHOLDER);
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), theme::font(13.5), Color32::PLACEHOLDER);
 
     let width = (galley.size().x + icon_w + gap + pad_x * 2.0).max(min_width);
     let height = theme::CONTROL_H;
 
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), sense);
 
     if !ui.is_rect_visible(rect) {
@@ -470,7 +476,11 @@ pub fn quick_action(ui: &mut Ui, icon: Icon, title: &str, hint_text: &str) -> Re
     painter.rect_filled(
         rect,
         radius,
-        if hovered { pal.card_hover } else { pal.card_alt },
+        if hovered {
+            pal.card_hover
+        } else {
+            pal.card_alt
+        },
     );
     painter.rect_stroke(
         rect,
@@ -559,11 +569,9 @@ pub fn choice_chip(ui: &mut Ui, selected: bool, icon: Option<Icon>, label: &str)
     let icon_size = 15.0;
     let gap = if icon.is_some() { 6.0 } else { 0.0 };
     let icon_w = if icon.is_some() { icon_size } else { 0.0 };
-    let galley = ui.painter().layout_no_wrap(
-        label.to_owned(),
-        theme::font(13.0),
-        Color32::PLACEHOLDER,
-    );
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), theme::font(13.0), Color32::PLACEHOLDER);
     let width = galley.size().x + icon_w + gap + 26.0;
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());
 
@@ -580,12 +588,18 @@ pub fn choice_chip(ui: &mut Ui, selected: bool, icon: Option<Icon>, label: &str)
 
         let painter = ui.painter();
         painter.rect_filled(rect, radius, fill);
-        painter.rect_stroke(rect, radius, theme::hairline(stroke_col), StrokeKind::Inside);
+        painter.rect_stroke(
+            rect,
+            radius,
+            theme::hairline(stroke_col),
+            StrokeKind::Inside,
+        );
 
         let mut x = rect.min.x + 13.0;
         let cy = rect.center().y;
         if let Some(icon) = icon {
-            let ir = Rect::from_min_size(Pos2::new(x, cy - icon_size / 2.0), Vec2::splat(icon_size));
+            let ir =
+                Rect::from_min_size(Pos2::new(x, cy - icon_size / 2.0), Vec2::splat(icon_size));
             icons::draw(painter, ir, icon, fg, icon_size);
             x += icon_size + gap;
         }
@@ -642,23 +656,16 @@ pub fn nav_item(
         );
         icons::draw(painter, ir, icon, fg, icon_size);
 
-        let galley = painter.layout_no_wrap(
-            label.to_owned(),
-            theme::font(13.5),
-            Color32::PLACEHOLDER,
-        );
+        let galley =
+            painter.layout_no_wrap(label.to_owned(), theme::font(13.5), Color32::PLACEHOLDER);
         painter.galley(
-            Pos2::new(
-                rect.min.x + 43.0,
-                rect.center().y - galley.size().y / 2.0,
-            ),
+            Pos2::new(rect.min.x + 43.0, rect.center().y - galley.size().y / 2.0),
             galley,
             fg,
         );
 
         if let Some(badge) = badge {
-            let galley =
-                painter.layout_no_wrap(badge, theme::font(11.0), Color32::PLACEHOLDER);
+            let galley = painter.layout_no_wrap(badge, theme::font(11.0), Color32::PLACEHOLDER);
             let w = galley.size().x + 14.0;
             let brect = Rect::from_min_size(
                 Pos2::new(rect.max.x - 12.0 - w, rect.center().y - 9.0),
@@ -687,11 +694,9 @@ pub fn pill(ui: &mut Ui, icon: Option<Icon>, text: &str, tone: Tone) {
     let pal = Palette::current(ui);
     let icon_size = 13.0;
     let gap = if icon.is_some() { 5.0 } else { 0.0 };
-    let galley = ui.painter().layout_no_wrap(
-        text.to_owned(),
-        theme::font(11.5),
-        Color32::PLACEHOLDER,
-    );
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), theme::font(11.5), Color32::PLACEHOLDER);
     let width = galley.size().x + if icon.is_some() { icon_size + gap } else { 0.0 } + 20.0;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 22.0), Sense::hover());
 
@@ -709,7 +714,8 @@ pub fn pill(ui: &mut Ui, icon: Option<Icon>, text: &str, tone: Tone) {
         let mut x = rect.min.x + 10.0;
         let cy = rect.center().y;
         if let Some(icon) = icon {
-            let ir = Rect::from_min_size(Pos2::new(x, cy - icon_size / 2.0), Vec2::splat(icon_size));
+            let ir =
+                Rect::from_min_size(Pos2::new(x, cy - icon_size / 2.0), Vec2::splat(icon_size));
             icons::draw(painter, ir, icon, fg, icon_size);
             x += icon_size + gap;
         }
@@ -810,10 +816,7 @@ pub fn empty_state_filling(
 /// A determinate (`fraction >= 0`) or indeterminate progress bar.
 pub fn progress(ui: &mut Ui, fraction: f32, phase: f32, color: Color32, height: f32) {
     let pal = Palette::current(ui);
-    let (rect, _) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), height),
-        Sense::hover(),
-    );
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
     }
@@ -841,10 +844,7 @@ pub fn progress(ui: &mut Ui, fraction: f32, phase: f32, color: Color32, height: 
         let x0 = x0.max(track.min.x);
         let x1 = x1.min(track.max.x);
         if x1 > x0 {
-            let bar = Rect::from_min_max(
-                Pos2::new(x0, track.min.y),
-                Pos2::new(x1, track.max.y),
-            );
+            let bar = Rect::from_min_max(Pos2::new(x0, track.min.y), Pos2::new(x1, track.max.y));
             painter.rect_filled(bar, radius, color);
         }
     }
@@ -865,9 +865,11 @@ pub fn switch(ui: &mut Ui, on: &mut bool) -> Response {
     }
 
     if ui.is_rect_visible(rect) {
-        let t = ui
-            .ctx()
-            .animate_bool_with_time(ui.make_persistent_id(("switch", rect.min.y as i32)), *on, 0.12);
+        let t = ui.ctx().animate_bool_with_time(
+            ui.make_persistent_id(("switch", rect.min.y as i32)),
+            *on,
+            0.12,
+        );
         let track = if *on { pal.accent } else { pal.rule_strong };
         let radius = CornerRadius::same(11);
         let painter = ui.painter();
@@ -919,11 +921,7 @@ pub fn toggle_row(ui: &mut Ui, on: &mut bool, title: &str, hint_text: &str) -> R
             text_w,
         );
         let title_h = title_galley.size().y;
-        let hint_h = if hint_text.is_empty() {
-            0.0
-        } else {
-            15.0
-        };
+        let hint_h = if hint_text.is_empty() { 0.0 } else { 15.0 };
         let block_h = title_h + hint_h;
         let top = rect.center().y - block_h / 2.0;
 
@@ -953,7 +951,11 @@ pub fn toggle_row(ui: &mut Ui, on: &mut bool, title: &str, hint_text: &str) -> R
             *on,
             0.12,
         );
-        painter.rect_filled(track, CornerRadius::same(11), if *on { pal.accent } else { pal.rule_strong });
+        painter.rect_filled(
+            track,
+            CornerRadius::same(11),
+            if *on { pal.accent } else { pal.rule_strong },
+        );
         let knob_x = egui::lerp((track.min.x + 11.0)..=(track.max.x - 11.0), t);
         painter.circle_filled(Pos2::new(knob_x, track.center().y), 8.0, pal.card);
         painter.circle_stroke(
@@ -1030,9 +1032,8 @@ pub fn default_line_color(line: &str, pal: &Palette) -> Color32 {
         pal.danger
     } else if line.contains("THREAT") || line.contains("FOUND") || line.contains("DETECTED") {
         pal.warning
-    } else if line.contains("INFO") {
-        pal.ink_soft
     } else {
+        // INFO and everything else: the ordinary ink, muted.
         pal.ink_soft
     }
 }
@@ -1043,13 +1044,7 @@ pub fn default_line_color(line: &str, pal: &Palette) -> Color32 {
 /// about the same as a ten line one. The height is exact rather than a maximum:
 /// these wells are the element that takes up the slack on their page, and a
 /// maximum let a short log leave the page looking half finished.
-pub fn log_well(
-    ui: &mut Ui,
-    id: &str,
-    lines: &[String],
-    height: f32,
-    colorize: LineColor,
-) {
+pub fn log_well(ui: &mut Ui, id: &str, lines: &[String], height: f32, colorize: LineColor) {
     let pal = Palette::current(ui);
     let height = height.max(48.0);
     let content_h = (height - WELL_PAD_Y).max(24.0);
@@ -1081,9 +1076,13 @@ pub fn log_well(
                     let line = &slice[i];
                     let color = colorize(line, &pal);
                     let response = ui.add(
-                        egui::Label::new(RichText::new(line).font(theme::mono(theme::FS_MONO)).color(color))
-                            .truncate()
-                            .sense(Sense::hover()),
+                        egui::Label::new(
+                            RichText::new(line)
+                                .font(theme::mono(theme::FS_MONO))
+                                .color(color),
+                        )
+                        .truncate()
+                        .sense(Sense::hover()),
                     );
                     if response.hovered() {
                         response.on_hover_text(line);
@@ -1147,9 +1146,15 @@ mod tests {
     #[test]
     fn a_page_header_stays_one_row_tall() {
         let height = used_height(|ui| {
-            page_header(ui, Icon::FileDoc, "总览", "系统当前的安全状态", |ui| {
-                let _ = outline(ui, None, "按钮");
-            });
+            page_header(
+                ui,
+                Icon::FileDoc,
+                "总览",
+                "系统当前的安全状态",
+                |ui| {
+                    let _ = outline(ui, None, "按钮");
+                },
+            );
         });
 
         assert!(

@@ -1,34 +1,46 @@
 name: GUI Quick CI
 
+# Every commit to main is checked, and so is every pull request against it. The
+# heavy "Build ClamAV GUI" workflow stays manual: it compiles ClamAV itself and
+# takes far longer than a commit should have to wait.
 on:
   push:
     branches:
       - main
-    paths:
-      - 'gui/**'
-      - '.github/workflows/ci-gui.yml'
-      - '.github/workflows/build-gui.yml'
   pull_request:
     branches:
       - main
-    paths:
-      - 'gui/**'
-      - '.github/workflows/ci-gui.yml'
-      - '.github/workflows/build-gui.yml'
+  workflow_dispatch:
+
+# Least privilege. These checks only read the repository; without this block the
+# job inherits the repository default (read/write) and a compromised action — or
+# a pull request build — could push to it.
+permissions:
+  contents: read
 
 concurrency:
   group: ci-gui-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  quick-check:
+  checks:
+    name: fmt, clippy, tests
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Nothing here has any reason to hold a credential that can write.
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -36,19 +48,26 @@ jobs:
           workspaces: |
             gui -> target
 
-      - name: Cargo check (debug)
-        run: |
-          cd gui
-          cargo check
-        shell: pwsh
+      # Formatting goes first: it is the cheapest check, and finding a stray
+      # space after a long build is the most annoying way to fail.
+      - name: Formatting
+        working-directory: gui
+        run: cargo fmt --all -- --check
 
-      # These used to be impossible to run: the build linked a manifest that
-      # required elevation into the test harness, so the test binary refused to
-      # start from a normal shell ("os error 740"). With that fixed the unit
-      # tests cover the argument builder, the clamscan output parsers, the
-      # config migrations and the path/size formatters.
-      - name: Cargo test
-        run: |
-          cd gui
-          cargo test
-        shell: pwsh
+      # `-D warnings` turns every lint into a failure, so warnings are fixed as
+      # they appear instead of scrolling past unnoticed.
+      - name: Clippy (warnings are errors)
+        working-directory: gui
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Covers the argument builder, the clamscan output parsers, the config
+      # migrations, the path/size formatters and the page-layout guards.
+      - name: Tests
+        working-directory: gui
+        run: cargo test --all-targets --locked
+
+      # `--all-targets` lints the test code too, which a plain `cargo check`
+      # never looks at.
+      - name: Check every target
+        working-directory: gui
+        run: cargo check --all-targets --locked

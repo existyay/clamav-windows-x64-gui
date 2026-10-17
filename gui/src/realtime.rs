@@ -428,7 +428,10 @@ impl RealtimeProtection {
                     } => {
                         let ts = chrono::Local::now().format("%H:%M:%S").to_string();
                         self.monitored_events += 1;
-                        self.push_log(format!("[{}] DETECTED: {} - {}", ts, rule_name, description));
+                        self.push_log(format!(
+                            "[{}] DETECTED: {} - {}",
+                            ts, rule_name, description
+                        ));
                         if self.threats.len() >= MAX_THREATS {
                             self.threats.drain(0..MAX_THREATS / 4);
                         }
@@ -592,10 +595,7 @@ fn yamagoya_daemon_start(
             tail_log_loop(log_path, cancel, tx);
         }
         Err(e) => {
-            let _ = tx.send(RealtimeMessage::Error(format!(
-                "启动 YAMAGoya 失败: {}",
-                e
-            )));
+            let _ = tx.send(RealtimeMessage::Error(format!("启动 YAMAGoya 失败: {}", e)));
             let _ = tx.send(RealtimeMessage::Stopped);
         }
     }
@@ -612,14 +612,15 @@ fn stop_yamagoya_daemon(yamagoya_path: &Path, log_dir: &Path) {
         return;
     };
 
-    let verified = match process_image_path(record.pid) {
-        Some(actual) => same_executable(&actual, yamagoya_path),
-        None => record
-            .image
-            .as_ref()
-            .map(|recorded| same_executable(recorded, yamagoya_path))
-            .unwrap_or(false),
-    };
+    // The image path has to come from the live process. The pid file records one
+    // too, but that string is data anyone with write access to the log directory
+    // can edit, so it is never accepted as proof of identity: if the process
+    // cannot be queried, it is left alone. The daemon is always one this program
+    // started as the same user, so a failed query means it has already exited —
+    // or that the PID now belongs to something else entirely.
+    let verified = process_image_path(record.pid)
+        .map(|actual| same_executable(&actual, yamagoya_path))
+        .unwrap_or(false);
 
     if verified {
         kill_process(record.pid);
@@ -675,7 +676,9 @@ fn kill_process(pid: u32) {
     #[cfg(target_os = "windows")]
     {
         use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
 
         let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
         if !handle.is_null() {

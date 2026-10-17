@@ -37,9 +37,15 @@ pub struct EnvInfo {
 #[derive(Clone, Debug)]
 pub enum BootMessage {
     /// A new step started; `total` is the number of units for this step.
-    Step { label: String, done: usize, total: usize },
+    Step {
+        label: String,
+        done: usize,
+        total: usize,
+    },
     /// Progress within the current step.
-    Progress { done: usize },
+    Progress {
+        done: usize,
+    },
     Info(String),
     Done(EnvInfo),
     Failed(String),
@@ -177,7 +183,14 @@ fn prepare(
     yamagoya_rules_dir: &std::path::Path,
     tx: &mpsc::Sender<BootMessage>,
 ) -> Result<EnvInfo, String> {
-    for dir in [clamav_dir, database_dir, quarantine_dir, log_dir, yamagoya_dir, yamagoya_rules_dir] {
+    for dir in [
+        clamav_dir,
+        database_dir,
+        quarantine_dir,
+        log_dir,
+        yamagoya_dir,
+        yamagoya_rules_dir,
+    ] {
         if let Err(e) = std::fs::create_dir_all(dir) {
             return Err(format!(
                 "无法创建目录 {}: {}",

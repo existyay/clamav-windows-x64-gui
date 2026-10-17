@@ -149,7 +149,10 @@ impl ScanShared {
 #[derive(Clone, Debug)]
 pub enum ScanMessage {
     /// Throttled "worker N is currently on this file".
-    CurrentFile { worker: usize, file: String },
+    CurrentFile {
+        worker: usize,
+        file: String,
+    },
     Threat(ThreatInfo),
     Log(String),
     /// A worker failed; the scan as a whole may still make progress.
@@ -241,10 +244,7 @@ pub fn build_command(opts: &ScanOptions, targets: &[PathBuf]) -> Command {
 
     // Content types. These were previously collected in the settings UI but
     // never reached the command line, so the toggles silently did nothing.
-    cmd.arg(format!(
-        "--scan-archive={}",
-        bool_arg(opts.scan_archives)
-    ));
+    cmd.arg(format!("--scan-archive={}", bool_arg(opts.scan_archives)));
     cmd.arg(format!("--scan-mail={}", bool_arg(opts.scan_mail)));
     cmd.arg(format!("--scan-ole2={}", bool_arg(opts.scan_ole2)));
     cmd.arg(format!("--scan-pdf={}", bool_arg(opts.scan_pdf)));
@@ -647,8 +647,7 @@ impl ScanEngine {
             return Err("文件不存在".into());
         }
 
-        std::fs::create_dir_all(quarantine_dir)
-            .map_err(|e| format!("无法创建隔离目录: {}", e))?;
+        std::fs::create_dir_all(quarantine_dir).map_err(|e| format!("无法创建隔离目录: {}", e))?;
 
         let name = src
             .file_name()
@@ -737,10 +736,7 @@ fn run_worker(
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            let _ = tx.send(ScanMessage::WorkerFailed(format!(
-                "启动扫描器失败: {}",
-                e
-            )));
+            let _ = tx.send(ScanMessage::WorkerFailed(format!("启动扫描器失败: {}", e)));
             mark_worker_finished(&shared, index);
             return;
         }
@@ -891,10 +887,7 @@ fn run_worker(
             }
         }
         Err(e) => {
-            let _ = tx.send(ScanMessage::WorkerFailed(format!(
-                "等待扫描器失败: {}",
-                e
-            )));
+            let _ = tx.send(ScanMessage::WorkerFailed(format!("等待扫描器失败: {}", e)));
         }
     }
 }
@@ -1075,10 +1068,7 @@ pub fn list_quarantine_entries(quarantine_dir: &Path) -> Vec<QuarantineEntry> {
 
         // One `metadata()` call per entry, not two.
         let (file_size, modified) = match dir_entry.metadata() {
-            Ok(meta) => (
-                meta.len(),
-                meta.modified().unwrap_or(std::time::UNIX_EPOCH),
-            ),
+            Ok(meta) => (meta.len(), meta.modified().unwrap_or(std::time::UNIX_EPOCH)),
             Err(_) => (0, std::time::UNIX_EPOCH),
         };
 
@@ -1096,17 +1086,33 @@ pub fn list_quarantine_entries(quarantine_dir: &Path) -> Vec<QuarantineEntry> {
         ));
     }
 
-    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    // Newest first.
+    entries.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
     entries.into_iter().map(|(_, e)| e).collect()
 }
 
 /// Put a quarantined file back where it came from.
+///
+/// Refuses when something already occupies the original path. `rename` replaces
+/// the destination on Windows, so restoring over whatever the user has created
+/// there since (or over a legitimate file that now has that name) would destroy
+/// it silently. The path comes from the `.meta` sidecar — a file on disk that
+/// this program wrote but anyone with write access to the quarantine directory
+/// can edit — so it is never trusted blindly.
 pub fn restore_quarantined(entry: &QuarantineEntry) -> Result<(), String> {
     let original = entry
         .meta
         .as_ref()
         .map(|m| PathBuf::from(&m.original_path))
         .ok_or_else(|| "缺少原始路径信息，无法恢复".to_string())?;
+
+    if original.as_os_str().is_empty() {
+        return Err("原始路径为空，无法恢复".to_string());
+    }
+
+    if original.exists() {
+        return Err("原位置已存在同名文件，恢复会覆盖它，请先移走该文件".to_string());
+    }
 
     if let Some(parent) = original.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1191,7 +1197,10 @@ mod tests {
             parse_metric("Scanned files: 1234", "Scanned files:"),
             Some(1234)
         );
-        assert_eq!(parse_metric("Infected files: 0", "Infected files:"), Some(0));
+        assert_eq!(
+            parse_metric("Infected files: 0", "Infected files:"),
+            Some(0)
+        );
         assert_eq!(
             parse_metric("Scanned directories: 12", "Scanned files:"),
             None
@@ -1206,9 +1215,15 @@ mod tests {
             parse_data_scanned_kib("Data scanned: 1.50 GiB"),
             Some(1_572_864)
         );
-        assert_eq!(parse_data_scanned_kib("Data scanned: 5 MiB"), Some(5 * 1024));
+        assert_eq!(
+            parse_data_scanned_kib("Data scanned: 5 MiB"),
+            Some(5 * 1024)
+        );
         assert_eq!(parse_data_scanned_kib("Data scanned: 2 KiB"), Some(2));
-        assert_eq!(parse_data_scanned_kib("Data scanned: 10 MB"), Some(10 * 1024));
+        assert_eq!(
+            parse_data_scanned_kib("Data scanned: 10 MB"),
+            Some(10 * 1024)
+        );
         assert_eq!(
             parse_data_scanned_kib("Data scanned: 3 GB"),
             Some(3 * 1024 * 1024)
@@ -1276,7 +1291,11 @@ mod tests {
     #[test]
     fn worker_count_is_clamped() {
         assert_eq!(effective_workers(0, 4), 1, "one worker for an empty list");
-        assert_eq!(effective_workers(1, 4), 1, "never more workers than targets");
+        assert_eq!(
+            effective_workers(1, 4),
+            1,
+            "never more workers than targets"
+        );
         assert_eq!(effective_workers(2, 8), 2);
         assert_eq!(effective_workers(100, 64), 8, "capped at 8 processes");
         assert_eq!(effective_workers(100, 0), 1);
@@ -1284,9 +1303,7 @@ mod tests {
 
     #[test]
     fn splitting_targets_never_loses_or_empties_anything() {
-        let targets: Vec<PathBuf> = (0..7)
-            .map(|i| PathBuf::from(format!(r"C:\t{i}")))
-            .collect();
+        let targets: Vec<PathBuf> = (0..7).map(|i| PathBuf::from(format!(r"C:\t{i}"))).collect();
 
         for requested in 1..=8 {
             let workers = effective_workers(targets.len(), requested);
@@ -1302,5 +1319,49 @@ mod tests {
                 "targets lost with {workers} workers"
             );
         }
+    }
+
+    /// Restoring must never replace a file that now occupies the original path.
+    #[test]
+    fn restoring_refuses_to_overwrite_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!("clamav-gui-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let original = dir.join("original.txt");
+        std::fs::write(&original, b"what the user has now").expect("seed destination");
+
+        let quarantined = dir.join("evil.exe.20260101.quarantine");
+        std::fs::write(&quarantined, b"quarantined payload").expect("seed quarantine");
+
+        let entry = QuarantineEntry {
+            quarantine_path: quarantined.clone(),
+            file_size: 19,
+            meta: Some(QuarantineMeta {
+                original_path: original.to_string_lossy().to_string(),
+                threat_name: "Test.Signature".to_string(),
+                quarantine_date: "2026-01-01 00:00:00".to_string(),
+            }),
+        };
+
+        let err = restore_quarantined(&entry).expect_err("must refuse an occupied path");
+        assert!(err.contains("同名文件"), "unexpected message: {err}");
+        assert_eq!(
+            std::fs::read(&original).expect("destination still readable"),
+            b"what the user has now",
+            "the occupied file must be left untouched"
+        );
+        assert!(quarantined.exists(), "the quarantined file must stay put");
+
+        // With the path free again the restore goes through as before.
+        std::fs::remove_file(&original).expect("free the path");
+        restore_quarantined(&entry).expect("restore into the free path");
+        assert_eq!(
+            std::fs::read(&original).expect("restored file"),
+            b"quarantined payload"
+        );
+        assert!(!quarantined.exists(), "the quarantined file was moved back");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -27,9 +27,7 @@ use crate::theme::{self, Palette, Tone};
 use crate::tray::{SystemTray, TrayAction};
 use crate::updater::DatabaseUpdater;
 use crate::widgets;
-use eframe::egui::{
-    self, Align, Color32, Layout, RichText, ScrollArea, Sense, Vec2,
-};
+use eframe::egui::{self, Align, Color32, Layout, RichText, ScrollArea, Sense, Vec2};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -129,6 +127,8 @@ struct Toast {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Confirm {
     DeleteAllQuarantine,
+    /// Index into `quarantine`; the entry itself is what gets deleted.
+    DeleteQuarantine(usize),
     ClearScanHistory,
     ResetSettings,
 }
@@ -308,9 +308,7 @@ impl ClamAvApp {
 
     /// How long until the next frame is needed.
     fn repaint_delay(&self) -> Duration {
-        if !self.bootstrap.finished
-            || self.scan_engine.is_scanning()
-            || self.updater.is_updating()
+        if !self.bootstrap.finished || self.scan_engine.is_scanning() || self.updater.is_updating()
         {
             // Progress bars and scrolling logs.
             Duration::from_millis(90)
@@ -428,15 +426,10 @@ impl ClamAvApp {
                 }
             }
             QuarantineIntent::Delete(index) => {
-                let Some(entry) = self.quarantine.get(index).cloned() else {
-                    return;
-                };
-                match scanner::delete_quarantined(&entry) {
-                    Ok(()) => {
-                        self.invalidate_quarantine();
-                        self.toast(ToastKind::Success, "已从隔离区删除");
-                    }
-                    Err(e) => self.toast(ToastKind::Danger, e),
+                // Permanent, so it goes through the confirmation modal rather
+                // than deleting on a single click.
+                if self.quarantine.get(index).is_some() {
+                    self.confirm = Some(Confirm::DeleteQuarantine(index));
                 }
             }
             QuarantineIntent::DeleteAll => {
@@ -450,6 +443,23 @@ impl ClamAvApp {
                 self.invalidate_quarantine();
                 self.toast(ToastKind::Success, format!("已删除 {} 个项目", removed));
             }
+        }
+    }
+
+    /// Delete one quarantined file for real.
+    ///
+    /// Only reached from the confirmation modal: the deletion is permanent, so a
+    /// single click on a list row must not be enough.
+    fn delete_quarantine_entry(&mut self, index: usize) {
+        let Some(entry) = self.quarantine.get(index).cloned() else {
+            return;
+        };
+        match scanner::delete_quarantined(&entry) {
+            Ok(()) => {
+                self.invalidate_quarantine();
+                self.toast(ToastKind::Success, "已从隔离区删除");
+            }
+            Err(e) => self.toast(ToastKind::Danger, e),
         }
     }
 
@@ -590,7 +600,9 @@ impl ClamAvApp {
     fn handle_bootstrap(&mut self) {
         self.bootstrap.poll();
 
-        if self.bootstrap.finished && self.updater.db_files.is_empty() && self.bootstrap.failed.is_none()
+        if self.bootstrap.finished
+            && self.updater.db_files.is_empty()
+            && self.bootstrap.failed.is_none()
         {
             self.updater.apply_env(&self.bootstrap.info);
         }
@@ -718,7 +730,7 @@ impl ClamAvApp {
                 (Tone::Neutral, "实时保护未开启", "点击开启".to_string())
             };
 
-            let clicked = widgets::card_tuned(
+            widgets::card_tuned(
                 ui,
                 Some(pal.surface(tone)),
                 Some(pal.tone_ink(tone).gamma_multiply(0.3)),
@@ -745,9 +757,6 @@ impl ClamAvApp {
                     });
                 },
             );
-
-            // The card is decorative; make the whole footer strip interactive.
-            let _ = clicked;
 
             ui.add_space(8.0);
 
@@ -783,7 +792,8 @@ impl ClamAvApp {
             "总览",
             "系统当前的安全状态",
             |ui| {
-                if widgets::outline_enabled(ui, Some(Icon::Refresh), "重新检查", !scanning).clicked()
+                if widgets::outline_enabled(ui, Some(Icon::Refresh), "重新检查", !scanning)
+                    .clicked()
                 {
                     // Re-read the signature database in place. Restarting the
                     // whole bootstrap would blank the interface behind the
@@ -800,7 +810,11 @@ impl ClamAvApp {
             widgets::card(ui, |ui| {
                 ui.horizontal(|ui| {
                     icons::paint(ui, Icon::Chip, 16.0, pal.accent);
-                    ui.label(theme::body(self.bootstrap.label.clone()).color(pal.ink).strong());
+                    ui.label(
+                        theme::body(self.bootstrap.label.clone())
+                            .color(pal.ink)
+                            .strong(),
+                    );
                 });
                 ui.add_space(6.0);
                 let fraction = self.bootstrap.fraction().unwrap_or(-1.0);
@@ -900,18 +914,22 @@ impl ClamAvApp {
                             if widgets::danger(ui, Some(Icon::Lock), "全部隔离").clicked() {
                                 hero_action = Some(ScanIntent::QuarantineAll);
                             }
-                            if widgets::outline(ui, Some(Icon::Magnifier), "查看详情").clicked() {
+                            if widgets::outline(ui, Some(Icon::Magnifier), "查看详情").clicked()
+                            {
                                 self.tab = Tab::Scan;
                             }
                         } else if !db_ready {
-                            if widgets::primary(ui, Some(Icon::Download), "更新病毒库").clicked() {
+                            if widgets::primary(ui, Some(Icon::Download), "更新病毒库").clicked()
+                            {
                                 self.tab = Tab::Update;
                             }
                         } else if self.realtime.is_running() {
-                            if widgets::outline(ui, Some(Icon::Magnifier), "立即扫描").clicked() {
+                            if widgets::outline(ui, Some(Icon::Magnifier), "立即扫描").clicked()
+                            {
                                 self.tab = Tab::Scan;
                             }
-                        } else if widgets::primary(ui, Some(Icon::Play), "开启实时保护").clicked() {
+                        } else if widgets::primary(ui, Some(Icon::Play), "开启实时保护").clicked()
+                        {
                             match self.realtime.start(&self.config) {
                                 Ok(()) => self.toast(ToastKind::Success, "实时保护已启动"),
                                 Err(e) => self.toast(ToastKind::Danger, e),
@@ -938,7 +956,11 @@ impl ClamAvApp {
                 Icon::ShieldAlert,
                 &threat_count.to_string(),
                 "当前威胁",
-                if threat_count > 0 { Tone::Danger } else { Tone::Success },
+                if threat_count > 0 {
+                    Tone::Danger
+                } else {
+                    Tone::Success
+                },
             );
             widgets::stat_tile(
                 &mut cols[1],
@@ -1031,7 +1053,12 @@ impl ClamAvApp {
                 theme::rule(ui);
                 ui.add_space(10.0);
 
-                widgets::kv(ui, "目标", &truncate_path(&self.scan_target_label, 46), None);
+                widgets::kv(
+                    ui,
+                    "目标",
+                    &truncate_path(&self.scan_target_label, 46),
+                    None,
+                );
                 widgets::kv(
                     ui,
                     "结果",
@@ -1063,7 +1090,9 @@ impl ClamAvApp {
                 ui.add_space(10.0);
 
                 let db_line = match (&self.updater.db_version, self.updater.db_sigs) {
-                    (Some(version), Some(sigs)) => format!("{} · {} 条签名", version, format_count(sigs)),
+                    (Some(version), Some(sigs)) => {
+                        format!("{} · {} 条签名", version, format_count(sigs))
+                    }
                     (Some(version), None) => format!("版本 {}", version),
                     _ => "未知".to_string(),
                 };
@@ -1074,7 +1103,11 @@ impl ClamAvApp {
                     &if self.updater.db_files.is_empty() {
                         "无".to_string()
                     } else {
-                        format!("{} 个 · {}", self.updater.db_files.len(), format_size(self.updater.db_bytes))
+                        format!(
+                            "{} 个 · {}",
+                            self.updater.db_files.len(),
+                            format_size(self.updater.db_bytes)
+                        )
                     },
                     None,
                 );
@@ -1112,8 +1145,7 @@ impl ClamAvApp {
                     ui.horizontal(|ui| {
                         icons::paint(ui, Icon::FileDoc, 14.0, pal.danger);
                         ui.label(
-                            theme::mono_text(truncate_path(&threat.file_path, 58))
-                                .color(pal.ink),
+                            theme::mono_text(truncate_path(&threat.file_path, 58)).color(pal.ink),
                         );
                         ui.label(theme::small(&threat.threat_name).color(pal.ink_faint));
                     });
@@ -1252,17 +1284,17 @@ impl ClamAvApp {
                 }
 
                 if let Some(home) = dirs::home_dir() {
-                    if widgets::choice_chip(ui, false, Some(Icon::Folder), "用户目录").clicked() {
+                    if widgets::choice_chip(ui, false, Some(Icon::Folder), "用户目录").clicked()
+                    {
                         intent = Some(ScanIntent::Start(vec![home]));
                     }
                 }
 
                 #[cfg(windows)]
                 {
-                    let windows_dir =
-                        std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| {
-                            PathBuf::from("C:\\Windows")
-                        });
+                    let windows_dir = std::env::var_os("SystemRoot")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
                     if windows_dir.is_dir()
                         && widgets::choice_chip(ui, false, Some(Icon::Chip), "系统目录").clicked()
                     {
@@ -1298,7 +1330,11 @@ impl ClamAvApp {
                                 ui.horizontal(|ui| {
                                     icons::paint(
                                         ui,
-                                        if path.is_dir() { Icon::Folder } else { Icon::FileDoc },
+                                        if path.is_dir() {
+                                            Icon::Folder
+                                        } else {
+                                            Icon::FileDoc
+                                        },
                                         14.0,
                                         pal.ink_faint,
                                     );
@@ -1310,7 +1346,8 @@ impl ClamAvApp {
                                         .color(pal.ink),
                                     );
                                     widgets::right_aligned(ui, |ui| {
-                                        if widgets::icon_button(ui, Icon::Close, "移除").clicked() {
+                                        if widgets::icon_button(ui, Icon::Close, "移除").clicked()
+                                        {
                                             intent = Some(ScanIntent::RemoveTarget(index));
                                         }
                                     });
@@ -1328,7 +1365,8 @@ impl ClamAvApp {
 
             ui.horizontal(|ui| {
                 let blocked = scanning || self.target_paths.is_empty();
-                if widgets::primary_enabled(ui, Some(Icon::Play), "开始扫描", !blocked).clicked() {
+                if widgets::primary_enabled(ui, Some(Icon::Play), "开始扫描", !blocked).clicked()
+                {
                     intent = Some(ScanIntent::Start(self.target_paths.clone()));
                 }
 
@@ -1405,9 +1443,7 @@ impl ClamAvApp {
                     // A single worker gives no percentage, so sweep instead of
                     // drawing a bar that would sit at zero for the whole run.
                     match self.scan_engine.progress_fraction() {
-                        Some(fraction) => {
-                            widgets::progress(ui, fraction, 0.0, pal.accent, 6.0)
-                        }
+                        Some(fraction) => widgets::progress(ui, fraction, 0.0, pal.accent, 6.0),
                         None => widgets::progress(ui, -1.0, phase(ctx), pal.accent, 6.0),
                     }
 
@@ -1510,9 +1546,7 @@ impl ClamAvApp {
                                         theme::mono_text(truncate_path(&threat.file_path, 62))
                                             .color(pal.ink),
                                     );
-                                    ui.label(
-                                        theme::small(&threat.threat_name).color(pal.danger),
-                                    );
+                                    ui.label(theme::small(&threat.threat_name).color(pal.danger));
                                 });
                                 widgets::right_aligned(ui, |ui| {
                                     if widgets::outline(ui, Some(Icon::Lock), "隔离").clicked() {
@@ -1604,7 +1638,11 @@ impl ClamAvApp {
             },
         );
 
-        let tone = if running { Tone::Success } else { Tone::Neutral };
+        let tone = if running {
+            Tone::Success
+        } else {
+            Tone::Neutral
+        };
 
         widgets::card_tuned(
             ui,
@@ -1617,7 +1655,11 @@ impl ClamAvApp {
                     icons::draw(
                         ui.painter(),
                         rect,
-                        if running { Icon::ShieldCheck } else { Icon::Shield },
+                        if running {
+                            Icon::ShieldCheck
+                        } else {
+                            Icon::Shield
+                        },
                         pal.tone_ink(tone),
                         40.0,
                     );
@@ -1727,9 +1769,7 @@ impl ClamAvApp {
                         .show(ui, |ui| {
                             for threat in threats.iter().rev().take(show) {
                                 ui.horizontal(|ui| {
-                                    ui.label(
-                                        theme::small(&threat.timestamp).color(pal.ink_faint),
-                                    );
+                                    ui.label(theme::small(&threat.timestamp).color(pal.ink_faint));
                                     ui.label(
                                         theme::small(&threat.threat_name)
                                             .color(pal.danger)
@@ -1895,12 +1935,7 @@ impl ClamAvApp {
                 }
 
                 ui.add_space(8.0);
-                widgets::kv(
-                    ui,
-                    "镜像",
-                    "database.clamav.net",
-                    Some(pal.ink_soft),
-                );
+                widgets::kv(ui, "镜像", "database.clamav.net", Some(pal.ink_soft));
                 widgets::kv(
                     ui,
                     "证书目录",
@@ -2079,7 +2114,11 @@ impl ClamAvApp {
                             icons::paint(ui, Icon::Lock, 18.0, pal.warning);
                             ui.add_space(2.0);
                             ui.vertical(|ui| {
-                                ui.label(theme::body(truncate_path(&name, 52)).color(pal.ink).strong());
+                                ui.label(
+                                    theme::body(truncate_path(&name, 52))
+                                        .color(pal.ink)
+                                        .strong(),
+                                );
                                 ui.label(theme::small(threat.clone()).color(pal.danger));
                                 ui.label(
                                     theme::mono_text(truncate_path(&original, 58))
@@ -2087,7 +2126,8 @@ impl ClamAvApp {
                                 );
                             });
                             widgets::right_aligned(ui, |ui| {
-                                if widgets::danger_outline(ui, Some(Icon::Trash), "删除").clicked() {
+                                if widgets::danger_outline(ui, Some(Icon::Trash), "删除").clicked()
+                                {
                                     intent = Some(QuarantineIntent::Delete(index));
                                 }
                                 if widgets::outline(ui, Some(Icon::Restore), "恢复").clicked() {
@@ -2120,33 +2160,37 @@ impl ClamAvApp {
     fn log_panel(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context, page_height: f32) {
         let pal = Palette::current(ui);
 
-        widgets::page_header(ui, Icon::FileDoc, "日志", "扫描、实时保护与更新的完整记录", |ui| {
-            let lines = self.current_log().to_vec();
-            if widgets::outline_enabled(ui, None, "导出", !lines.is_empty()).clicked() {
-                let name = match self.log_source {
-                    LogSource::Scan => "scan.log",
-                    LogSource::Realtime => "realtime.log",
-                    LogSource::Update => "update.log",
-                };
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_title("导出日志")
-                    .set_file_name(name)
-                    .save_file()
-                {
-                    match std::fs::write(&path, lines.join("\r\n")) {
-                        Ok(()) => self.toast(
-                            ToastKind::Success,
-                            format!("已导出到 {}", path.display()),
-                        ),
-                        Err(e) => self.toast(ToastKind::Danger, format!("导出失败: {}", e)),
+        widgets::page_header(
+            ui,
+            Icon::FileDoc,
+            "日志",
+            "扫描、实时保护与更新的完整记录",
+            |ui| {
+                let lines = self.current_log().to_vec();
+                if widgets::outline_enabled(ui, None, "导出", !lines.is_empty()).clicked() {
+                    let name = match self.log_source {
+                        LogSource::Scan => "scan.log",
+                        LogSource::Realtime => "realtime.log",
+                        LogSource::Update => "update.log",
+                    };
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_title("导出日志")
+                        .set_file_name(name)
+                        .save_file()
+                    {
+                        match std::fs::write(&path, lines.join("\r\n")) {
+                            Ok(()) => self
+                                .toast(ToastKind::Success, format!("已导出到 {}", path.display())),
+                            Err(e) => self.toast(ToastKind::Danger, format!("导出失败: {}", e)),
+                        }
                     }
                 }
-            }
-            if widgets::quiet(ui, None, "复制").clicked() {
-                ui.ctx().copy_text(lines.join("\n"));
-                self.toast(ToastKind::Info, "日志已复制到剪贴板");
-            }
-        });
+                if widgets::quiet(ui, None, "复制").clicked() {
+                    ui.ctx().copy_text(lines.join("\n"));
+                    self.toast(ToastKind::Info, "日志已复制到剪贴板");
+                }
+            },
+        );
 
         ui.horizontal(|ui| {
             for (source, label) in [
@@ -2202,12 +2246,18 @@ impl ClamAvApp {
     fn settings_panel(&mut self, ui: &mut egui::Ui) {
         let pal = Palette::current(ui);
 
-        widgets::page_header(ui, Icon::Sliders, "设置", "扫描行为、排除规则与目录位置", |ui| {
-            if widgets::primary(ui, Some(Icon::Check), "保存设置").clicked() {
-                self.save_config();
-                self.toast(ToastKind::Success, "设置已保存");
-            }
-        });
+        widgets::page_header(
+            ui,
+            Icon::Sliders,
+            "设置",
+            "扫描行为、排除规则与目录位置",
+            |ui| {
+                if widgets::primary(ui, Some(Icon::Check), "保存设置").clicked() {
+                    self.save_config();
+                    self.toast(ToastKind::Success, "设置已保存");
+                }
+            },
+        );
 
         // The page itself scrolls; the panel must not nest another ScrollArea
         // inside it, which is what previously made the wheel behave oddly over
@@ -2610,6 +2660,19 @@ impl ClamAvApp {
                 "隔离区中的全部文件将被永久删除，此操作无法撤销。".to_string(),
                 "永久删除",
             ),
+            Confirm::DeleteQuarantine(index) => {
+                let name = self
+                    .quarantine
+                    .get(index)
+                    .and_then(|e| e.quarantine_path.file_name())
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "该文件".to_string());
+                (
+                    "删除隔离文件？",
+                    format!("「{}」将被永久删除，此操作无法撤销。", name),
+                    "永久删除",
+                )
+            }
             Confirm::ClearScanHistory => (
                 "清除扫描历史？",
                 "仅删除本程序记录的扫描结果，不会影响磁盘上的任何文件。".to_string(),
@@ -2650,6 +2713,7 @@ impl ClamAvApp {
                     Confirm::DeleteAllQuarantine => {
                         self.apply_quarantine_intent(QuarantineIntent::DeleteAll)
                     }
+                    Confirm::DeleteQuarantine(index) => self.delete_quarantine_entry(index),
                     Confirm::ClearScanHistory => {
                         let path = self.config.scan_history_path();
                         let _ = std::fs::remove_file(&path);
@@ -2753,7 +2817,6 @@ impl ClamAvApp {
 
 impl eframe::App for ClamAvApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-
         // --- Pump background work --------------------------------------
         self.handle_bootstrap();
         self.scan_engine.poll_messages();
@@ -3008,7 +3071,7 @@ fn format_count(value: u64) -> String {
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
 
     for (index, ch) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -3197,5 +3260,3 @@ mod tests {
         }
     }
 }
-
-

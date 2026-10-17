@@ -10,7 +10,9 @@
 //! * behaviour is identical on every platform (no tofu boxes).
 
 use eframe::egui;
-use egui::{Color32, CornerRadius, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, Vec2};
+use egui::{
+    Color32, CornerRadius, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, Vec2,
+};
 
 /// The available glyphs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,10 +174,7 @@ impl<'a> Pen<'a> {
         let tip = self.at(x, y);
         for delta in [150.0_f32, -150.0] {
             let a = (angle + delta).to_radians();
-            let p = Pos2::new(
-                tip.x + a.cos() * self.r(len),
-                tip.y + a.sin() * self.r(len),
-            );
+            let p = Pos2::new(tip.x + a.cos() * self.r(len), tip.y + a.sin() * self.r(len));
             self.painter.line_segment([tip, p], self.stroke);
         }
     }
