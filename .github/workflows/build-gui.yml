@@ -608,6 +608,8 @@ jobs:
             这是本项目**唯一**的发布：标签固定为 `latest`，每次构建都会覆盖本页的
             安装包与说明，所以下载地址永远不变（固定链接见下）。历史版本不再保留。
 
+            本次构建：提交 `${{ github.sha }}`（build ${{ steps.version.outputs.build }}）
+
             - 固定下载（永久有效）：
               `https://github.com/${{ github.repository }}/releases/latest/download/ClamAV-GUI-Portable-x64.zip`
               `https://github.com/${{ github.repository }}/releases/latest/download/ClamAV-Scanner-Standalone-x64.exe`

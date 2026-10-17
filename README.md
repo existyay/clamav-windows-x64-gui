@@ -29,6 +29,10 @@
 
 从 [Releases](https://github.com/existyay/clamav-windows-x64-gui/releases/latest) 下载最新版 `ClamAV-GUI-Portable-x64.zip`。
 
+> **只有一个发布。** 每次推送都会自动构建并发布，新产物直接覆盖 `latest`：下载链接
+> 永远指向最近一次构建，历史版本不再保留。这次构建对应的版本、提交号与构建号写在
+> 包内的 `BUILD_INFO.txt` 里。
+
 解压后直接运行 `ClamAV-Scanner.exe`，无需安装。首次使用请先更新病毒库。
 
 ### 目录结构
