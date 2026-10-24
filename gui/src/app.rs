@@ -2512,6 +2512,11 @@ impl ClamAvApp {
                             if widgets::outline(ui, Some(Icon::ShieldCheck), "以管理员身份重启")
                                 .clicked()
                             {
+                                // Complete the old generation's shutdown before the
+                                // elevated GUI can reconnect to the same daemon.
+                                if self.realtime.has_pending_work() {
+                                    self.realtime.stop_blocking(&self.config);
+                                }
                                 match crate::relaunch_as_admin() {
                                     Ok(()) => {
                                         // Hand the single-instance lock over to
@@ -2852,6 +2857,10 @@ impl eframe::App for ClamAvApp {
         // The window is only minimised, so this branch still runs: a tray menu
         // click is noticed from here, and everything below is what would cost
         // real CPU if it kept running behind a closed window.
+        if self.hidden && ctx.input(|input| input.viewport().minimized == Some(false)) {
+            // Taskbar / Alt+Tab restoration bypasses the tray callback.
+            self.hidden = false;
+        }
         if self.hidden {
             let toast_expired = self
                 .toast
@@ -2985,7 +2994,7 @@ impl Drop for ClamAvApp {
         // The monitor is only left running when the user explicitly asked for
         // that; otherwise shut it down synchronously, because a spawned thread
         // would be torn down with the process before it finished.
-        if self.realtime.is_running() && !self.config.persist_realtime_on_exit {
+        if self.realtime.has_pending_work() && !self.config.persist_realtime_on_exit {
             self.realtime.stop_blocking(&self.config);
         }
 

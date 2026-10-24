@@ -15,6 +15,7 @@
 
 use crate::bootstrap::EnvInfo;
 use crate::config::AppConfig;
+use crate::scanner::{ManagedChild, ProcessControl};
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -53,7 +54,8 @@ pub struct DatabaseUpdater {
     pub db_modified: Option<String>,
     /// Last failure, surfaced as an inline banner.
     pub last_error: Option<String>,
-    child_id: Arc<Mutex<Option<u32>>>,
+    control: Arc<ProcessControl>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Default for DatabaseUpdater {
@@ -70,14 +72,15 @@ impl Default for DatabaseUpdater {
             db_bytes: 0,
             db_modified: None,
             last_error: None,
-            child_id: Arc::new(Mutex::new(None)),
+            control: Arc::new(ProcessControl::default()),
+            worker: None,
         }
     }
 }
 
 impl DatabaseUpdater {
     pub fn is_updating(&self) -> bool {
-        self.state == UpdateState::Updating
+        self.worker.is_some() || self.state == UpdateState::Updating
     }
 
     /// Adopt the database information gathered by the background bootstrap.
@@ -116,20 +119,21 @@ impl DatabaseUpdater {
         let _ = std::fs::create_dir_all(&certs_dir);
         ensure_freshclam_conf(&conf_path, &config.database_dir, &certs_dir);
 
-        let child_id = self.child_id.clone();
-        std::thread::spawn(move || {
-            run_freshclam(freshclam, conf_path, certs_dir, child_id, tx);
-        });
+        let control = Arc::new(ProcessControl::default());
+        self.control = control.clone();
+        self.worker = Some(std::thread::spawn(move || {
+            run_freshclam(freshclam, conf_path, certs_dir, control, tx);
+        }));
 
         Ok(())
     }
 
     /// Ask `freshclam` to stop.
     pub fn cancel_update(&mut self) {
-        let pid = self.child_id.lock().ok().and_then(|mut id| id.take());
-        if let Some(pid) = pid {
-            kill_process(pid);
+        if self.is_updating() {
+            self.control.cancel();
         }
+        // Keep Updating until the worker has reaped the child and readers.
     }
 
     pub fn poll_messages(&mut self, config: &AppConfig) {
@@ -170,7 +174,26 @@ impl DatabaseUpdater {
             }
         }
 
+        if finished.is_none()
+            && self
+                .worker
+                .as_ref()
+                .map(|h| h.is_finished())
+                .unwrap_or(false)
+        {
+            finished = Some((false, "更新工作线程意外退出".to_string()));
+        }
         if let Some((success, message)) = finished {
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+            self.receiver = None;
+            let success = success && !self.control.cancelled();
+            let message = if self.control.cancelled() {
+                "病毒库更新已取消".to_string()
+            } else {
+                message
+            };
             self.state = UpdateState::Done;
             self.progress = None;
             push_bounded(&mut self.log_lines, message.clone());
@@ -188,9 +211,9 @@ impl DatabaseUpdater {
 
 impl Drop for DatabaseUpdater {
     fn drop(&mut self) {
-        let pid = self.child_id.lock().ok().and_then(|mut id| id.take());
-        if let Some(pid) = pid {
-            kill_process(pid);
+        self.control.cancel();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
     }
 }
@@ -232,9 +255,16 @@ fn run_freshclam(
     freshclam_path: PathBuf,
     conf_path: PathBuf,
     certs_dir: PathBuf,
-    child_id: Arc<Mutex<Option<u32>>>,
+    control: Arc<ProcessControl>,
     tx: mpsc::Sender<UpdateMessage>,
 ) {
+    if control.cancelled() {
+        let _ = tx.send(UpdateMessage::Finished {
+            success: false,
+            message: "病毒库更新已取消".to_string(),
+        });
+        return;
+    }
     if !freshclam_path.exists() {
         let _ = tx.send(UpdateMessage::Finished {
             success: false,
@@ -262,7 +292,7 @@ fn run_freshclam(
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
 
-    let mut child = match cmd.spawn() {
+    let child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             let _ = tx.send(UpdateMessage::Finished {
@@ -273,15 +303,12 @@ fn run_freshclam(
         }
     };
 
-    let pid = child.id();
-    if let Ok(mut id) = child_id.lock() {
-        *id = Some(pid);
-    }
+    let mut child = ManagedChild::new(child, control.clone());
 
     let _ = tx.send(UpdateMessage::Line("正在连接更新服务器...".to_string()));
 
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let stdout = child.child.stdout.take();
+    let stderr = child.child.stderr.take();
 
     // Both streams are split on '\r' as well as '\n' so progress bars appear
     // immediately. `freshclam` is not chatty, so byte-at-a-time through a
@@ -311,26 +338,20 @@ fn run_freshclam(
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
 
-    if let Ok(mut id) = child_id.lock() {
-        *id = None;
-    }
-
-    let reported = tail.lock().map(|t| t.clone()).unwrap_or_default();
-
-    let (success, message) = match status {
-        Ok(status) => {
-            let code = status.code().unwrap_or(-1);
-            if code == 0 {
-                (true, "病毒库更新完成".to_string())
-            } else if reports_success(&reported) {
-                // Some builds exit non-zero after a successful update or when
-                // the database was already current; trust the output then.
-                (true, "病毒库已是最新版本".to_string())
-            } else {
-                (false, format!("freshclam 以退出代码 {} 结束", code))
+    let (success, message) = if control.cancelled() {
+        (false, "病毒库更新已取消".to_string())
+    } else {
+        match status {
+            Ok(status) => {
+                let code = status.code().unwrap_or(-1);
+                if code == 0 {
+                    (true, "病毒库更新完成".to_string())
+                } else {
+                    (false, format!("freshclam 以退出代码 {} 结束", code))
+                }
             }
+            Err(e) => (false, format!("等待 freshclam 失败: {}", e)),
         }
-        Err(e) => (false, format!("等待 freshclam 失败: {}", e)),
     };
 
     let _ = tx.send(UpdateMessage::Finished { success, message });
@@ -349,14 +370,6 @@ fn missing_freshclam_message(path: &std::path::Path) -> String {
         "未找到更新程序 freshclam: {}",
         crate::config::display_path(path)
     )
-}
-
-fn reports_success(output: &str) -> bool {
-    let lowered = output.to_ascii_lowercase();
-    lowered.contains("up-to-date")
-        || lowered.contains("up to date")
-        || lowered.contains("database updated")
-        || lowered.contains("is up-todate")
 }
 
 /// Read a stream, emitting one message per `\n`- or `\r`-terminated record.
@@ -496,27 +509,6 @@ fn clean_log_line(line: &str) -> String {
     }
 
     out.trim().to_string()
-}
-
-fn kill_process(pid: u32) {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        let _ = Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(0x0800_0000)
-            .status();
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
 }
 
 #[cfg(test)]

@@ -19,7 +19,7 @@ use crate::config::AppConfig;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -290,13 +290,105 @@ fn bool_arg(value: bool) -> &'static str {
 // Engine
 // ---------------------------------------------------------------------------
 
+/// Cancellation and registration share one lock: a child can never register
+/// behind a cancellation without observing it. Each run owns a fresh control.
+#[derive(Default)]
+pub(crate) struct ProcessControl {
+    state: Mutex<ProcessState>,
+}
+
+#[derive(Default)]
+struct ProcessState {
+    cancelled: bool,
+    children: Vec<u32>,
+}
+
+impl ProcessControl {
+    pub(crate) fn cancel(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.cancelled = true;
+        // Keep registrations until their owners have reaped the children.
+        for &pid in &state.children {
+            kill_process_tree(pid);
+        }
+    }
+
+    pub(crate) fn cancelled(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancelled
+    }
+
+    fn register(&self, pid: u32) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.children.push(pid);
+        if state.cancelled {
+            kill_process_tree(pid);
+        }
+    }
+
+    fn remove(&self, pid: u32) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .children
+            .retain(|&id| id != pid);
+    }
+}
+
+/// Owns the actual child, so every early return and unwind kills and reaps it.
+/// Construct immediately after spawn, before reading any pipes.
+pub(crate) struct ManagedChild {
+    pub(crate) child: Child,
+    control: Arc<ProcessControl>,
+    reaped: bool,
+}
+
+impl ManagedChild {
+    pub(crate) fn new(child: Child, control: Arc<ProcessControl>) -> Self {
+        let managed = Self {
+            child,
+            control,
+            reaped: false,
+        };
+        managed.control.register(managed.child.id());
+        managed
+    }
+
+    pub(crate) fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        let status = self.child.wait();
+        if status.is_ok() {
+            self.control.remove(self.child.id());
+            self.reaped = true;
+        }
+        status
+    }
+
+    pub(crate) fn kill(&mut self) {
+        kill_process_tree(self.child.id());
+        let _ = self.child.kill();
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            self.kill();
+            let _ = self.wait();
+            self.control.remove(self.child.id());
+        }
+    }
+}
+
 pub struct ScanEngine {
     pub state: ScanState,
     receiver: Option<mpsc::Receiver<ScanMessage>>,
     pub threats: Vec<ThreatInfo>,
     pub stats: ScanStats,
     pub log_lines: Vec<String>,
-    cancel_flag: Arc<Mutex<bool>>,
+    control: Arc<ProcessControl>,
+    worker: Option<std::thread::JoinHandle<()>>,
     /// File currently being scanned, for the progress banner.
     pub current_file: String,
     /// Which worker reported `current_file`.
@@ -309,8 +401,6 @@ pub struct ScanEngine {
     stats_base: ScanStats,
     /// Live counters shared with the workers.
     shared: Option<Arc<Mutex<ScanShared>>>,
-    /// PIDs of every live `clamscan` child.
-    child_ids: Arc<Mutex<Vec<u32>>>,
     /// Deduplication index for [`Self::threats`].
     threat_paths: HashSet<String>,
     /// Set when history was restored, so a stale threat list is not
@@ -326,7 +416,8 @@ impl Default for ScanEngine {
             threats: Vec::new(),
             stats: ScanStats::default(),
             log_lines: Vec::new(),
-            cancel_flag: Arc::new(Mutex::new(false)),
+            control: Arc::new(ProcessControl::default()),
+            worker: None,
             current_file: String::new(),
             current_worker: 0,
             scan_started_at: None,
@@ -334,7 +425,6 @@ impl Default for ScanEngine {
             scan_target_paths: Vec::new(),
             stats_base: ScanStats::default(),
             shared: None,
-            child_ids: Arc::new(Mutex::new(Vec::new())),
             threat_paths: HashSet::new(),
             restored_from_history: false,
         }
@@ -343,7 +433,7 @@ impl Default for ScanEngine {
 
 impl ScanEngine {
     pub fn is_scanning(&self) -> bool {
-        self.state == ScanState::Scanning
+        self.worker.is_some() || self.state == ScanState::Scanning
     }
 
     /// Live totals straight from the workers, for the progress display.
@@ -424,8 +514,8 @@ impl ScanEngine {
     }
 
     fn spawn(&mut self, targets: Vec<PathBuf>, opts: ScanOptions) {
-        let cancel = Arc::new(Mutex::new(false));
-        self.cancel_flag = cancel.clone();
+        let control = Arc::new(ProcessControl::default());
+        self.control = control.clone();
 
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
@@ -434,10 +524,9 @@ impl ScanEngine {
         let shared = Arc::new(Mutex::new(ScanShared::new(workers)));
         self.shared = Some(shared.clone());
 
-        let child_ids = self.child_ids.clone();
         let chunks = split_targets(targets, workers);
 
-        std::thread::spawn(move || {
+        self.worker = Some(std::thread::spawn(move || {
             if !opts.scanner.exists() {
                 let _ = tx.send(ScanMessage::Error(format!(
                     "扫描引擎未找到: {}",
@@ -450,12 +539,11 @@ impl ScanEngine {
             for (index, chunk) in chunks.into_iter().enumerate() {
                 let opts = opts.clone();
                 let shared = shared.clone();
-                let cancel = cancel.clone();
-                let child_ids = child_ids.clone();
+                let control = control.clone();
                 let tx = tx.clone();
 
                 handles.push(std::thread::spawn(move || {
-                    run_worker(index, chunk, opts, shared, cancel, child_ids, tx);
+                    run_worker(index, chunk, opts, shared, control, tx);
                 }));
             }
 
@@ -464,53 +552,24 @@ impl ScanEngine {
             }
 
             let _ = tx.send(ScanMessage::Finished);
-        });
+        }));
     }
 
     pub fn cancel_scan(&mut self) {
-        let was_scanning = self.is_scanning();
-
-        if let Ok(mut flag) = self.cancel_flag.lock() {
-            *flag = true;
-        }
-
-        // Fold the live worker counters into the base *before* dropping the
-        // shared state, otherwise the numbers would collapse back to whatever
-        // the previous scan reported.
-        let totals = self.totals();
-        self.stats_base.scanned_files += totals.scanned;
-        self.stats_base.infected_files += totals.infected;
-        self.stats_base.scanned_data_mb += totals.bytes as f64 / (1024.0 * 1024.0);
-
-        // Kill every live child; this also unblocks the blocking readers.
-        let pids: Vec<u32> = self
-            .child_ids
-            .lock()
-            .map(|mut ids| std::mem::take(&mut *ids))
-            .unwrap_or_default();
-        for pid in pids {
-            kill_process_tree(pid);
-        }
-
-        // Drop the receiver so late messages are discarded.
-        self.receiver = None;
-        self.shared = None;
-
-        if let Some(started) = self.scan_started_at {
-            self.stats_base.elapsed_secs += started.elapsed().as_secs_f64();
-        }
-
-        if was_scanning {
+        if self.is_scanning() {
             self.was_cancelled = true;
+            self.control.cancel();
+            self.current_file.clear();
         }
-
-        self.state = ScanState::Finished;
-        self.scan_started_at = None;
-        self.current_file.clear();
-        self.stats = self.stats_base.clone();
+        // Stay busy and retain counters/channel until the worker has exited.
     }
 
     pub fn poll_messages(&mut self) {
+        let exited = self
+            .worker
+            .as_ref()
+            .map(|h| h.is_finished())
+            .unwrap_or(false);
         let mut finished = false;
 
         // The receiver is taken out of `self` for the duration of the drain so
@@ -552,7 +611,18 @@ impl ScanEngine {
             }
         }
 
+        // Disconnection (including a panicking worker) is also terminal, but
+        // never release busy until the coordinator and all its workers exit.
+        finished |= exited;
         if finished {
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+            self.receiver = None;
+            if let Some(started) = self.scan_started_at {
+                self.stats.elapsed_secs =
+                    self.stats_base.elapsed_secs + started.elapsed().as_secs_f64();
+            }
             self.state = ScanState::Finished;
             self.scan_started_at = None;
             self.current_file.clear();
@@ -669,30 +739,38 @@ impl ScanEngine {
             }
         }
 
-        move_file_cross_drive(&src, &dest)?;
-
         let meta = QuarantineMeta {
             original_path: threat.file_path.clone(),
             threat_name: threat.threat_name.clone(),
             quarantine_date: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         };
-        if let Ok(json) = serde_json::to_string_pretty(&meta) {
-            let _ = std::fs::write(meta_path_for(&dest), json);
+        let json = serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string())?;
+        let meta_path = meta_path_for(&dest);
+        let mut metadata = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&meta_path)
+            .map_err(|e| format!("无法保存恢复信息，原文件未移动: {e}"))?;
+        let saved =
+            std::io::Write::write_all(&mut metadata, &json).and_then(|_| metadata.sync_all());
+        drop(metadata);
+        if let Err(e) = saved {
+            let _ = std::fs::remove_file(&meta_path);
+            return Err(format!("无法保存恢复信息，原文件未移动: {e}"));
         }
-
+        if let Err(e) = move_file_cross_drive(&src, &dest) {
+            let _ = std::fs::remove_file(&meta_path);
+            return Err(e);
+        }
         Ok(dest)
     }
 }
 
 impl Drop for ScanEngine {
     fn drop(&mut self) {
-        let pids: Vec<u32> = self
-            .child_ids
-            .lock()
-            .map(|mut ids| std::mem::take(&mut *ids))
-            .unwrap_or_default();
-        for pid in pids {
-            kill_process_tree(pid);
+        self.control.cancel();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
     }
 }
@@ -718,22 +796,21 @@ fn split_targets(targets: Vec<PathBuf>, workers: usize) -> Vec<Vec<PathBuf>> {
     chunks
 }
 
-fn cancelled(flag: &Arc<Mutex<bool>>) -> bool {
-    flag.lock().map(|f| *f).unwrap_or(false)
-}
-
 fn run_worker(
     index: usize,
     targets: Vec<PathBuf>,
     opts: ScanOptions,
     shared: Arc<Mutex<ScanShared>>,
-    cancel: Arc<Mutex<bool>>,
-    child_ids: Arc<Mutex<Vec<u32>>>,
+    control: Arc<ProcessControl>,
     tx: mpsc::Sender<ScanMessage>,
 ) {
+    if control.cancelled() {
+        mark_worker_finished(&shared, index);
+        return;
+    }
     let mut cmd = build_command(&opts, &targets);
 
-    let mut child = match cmd.spawn() {
+    let child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             let _ = tx.send(ScanMessage::WorkerFailed(format!("启动扫描器失败: {}", e)));
@@ -742,22 +819,19 @@ fn run_worker(
         }
     };
 
-    let pid = child.id();
-    if let Ok(mut ids) = child_ids.lock() {
-        ids.push(pid);
-    }
+    let mut child = ManagedChild::new(child, control.clone());
 
-    let Some(stdout) = child.stdout.take() else {
+    let Some(stdout) = child.child.stdout.take() else {
         let _ = tx.send(ScanMessage::WorkerFailed("无法读取扫描器输出".into()));
+        child.kill();
         let _ = child.wait();
-        remove_child(&child_ids, pid);
         mark_worker_finished(&shared, index);
         return;
     };
 
     // Drain stderr on its own thread so a chatty child cannot deadlock on a
     // full pipe buffer while we are reading stdout.
-    let stderr = child.stderr.take();
+    let stderr = child.child.stderr.take();
     let stderr_handle = std::thread::spawn(move || {
         let Some(stderr) = stderr else {
             return String::new();
@@ -798,14 +872,17 @@ fn run_worker(
     let mut line = String::with_capacity(1024);
 
     loop {
-        if cancelled(&cancel) {
+        if control.cancelled() {
             break;
         }
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => break,
             Ok(_) => {}
-            Err(_) => continue,
+            Err(_) => {
+                child.kill();
+                break;
+            }
         }
 
         let text = line.trim_end_matches(['\r', '\n']);
@@ -861,10 +938,12 @@ fn run_worker(
         bytes = v;
     }
 
-    let was_cancelled = cancelled(&cancel);
+    let was_cancelled = control.cancelled();
+    if was_cancelled {
+        child.kill();
+    }
     let status = child.wait();
     let stderr_text = stderr_handle.join().unwrap_or_default();
-    remove_child(&child_ids, pid);
 
     publish(&shared, index, "", scanned, infected, bytes);
     mark_worker_finished(&shared, index);
@@ -919,12 +998,6 @@ fn mark_worker_finished(shared: &Arc<Mutex<ScanShared>>, index: usize) {
             worker.finished = true;
             worker.file.clear();
         }
-    }
-}
-
-fn remove_child(child_ids: &Arc<Mutex<Vec<u32>>>, pid: u32) {
-    if let Ok(mut ids) = child_ids.lock() {
-        ids.retain(|&id| id != pid);
     }
 }
 
@@ -1037,19 +1110,26 @@ fn meta_path_for(dest: &Path) -> PathBuf {
 /// Move a file, falling back to copy+delete when the destination is on another
 /// volume (where `rename` fails).
 fn move_file_cross_drive(src: &Path, dest: &Path) -> Result<(), String> {
-    if std::fs::rename(src, dest).is_ok() {
-        return Ok(());
+    // Atomic no-clobber reservation: never overwrite a file created after the
+    // caller's existence check. Works across volumes without a rename fallback.
+    let mut input = std::fs::File::open(src).map_err(|e| format!("读取文件失败: {e}"))?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .map_err(|e| format!("创建目标失败（不会覆盖已有文件）: {e}"))?;
+    let copied = std::io::copy(&mut input, &mut output).and_then(|_| output.sync_all());
+    drop(output);
+    drop(input);
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(dest);
+        return Err(format!("复制文件失败: {e}"));
     }
-
-    std::fs::copy(src, dest).map_err(|e| format!("复制文件失败: {}", e))?;
-
-    match std::fs::remove_file(src) {
-        Ok(()) => Ok(()),
-        Err(e) => Err(format!(
-            "文件已复制到隔离区，但无法删除原文件（可能被占用）: {}",
-            e
-        )),
+    if let Err(e) = std::fs::remove_file(src) {
+        let _ = std::fs::remove_file(dest);
+        return Err(format!("无法移走原文件，隔离/恢复未完成: {e}"));
     }
+    Ok(())
 }
 
 /// List the quarantine directory, newest first.
@@ -1106,8 +1186,17 @@ pub fn restore_quarantined(entry: &QuarantineEntry) -> Result<(), String> {
         .map(|m| PathBuf::from(&m.original_path))
         .ok_or_else(|| "缺少原始路径信息，无法恢复".to_string())?;
 
-    if original.as_os_str().is_empty() {
-        return Err("原始路径为空，无法恢复".to_string());
+    if !original.is_absolute()
+        || original
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err("原始路径必须是绝对路径且不得包含上级目录，无法恢复".to_string());
+    }
+    // Sidecars are writable data, not authority to write system locations with
+    // elevated privileges. Restore from a non-elevated GUI instead.
+    if crate::is_elevated() {
+        return Err("为避免被篡改的恢复路径以管理员权限写入，请使用普通权限运行后恢复".to_string());
     }
 
     if original.exists() {
@@ -1135,6 +1224,30 @@ pub fn delete_quarantined(entry: &QuarantineEntry) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_is_persistent_and_run_local() {
+        let old = ProcessControl::default();
+        old.cancel();
+        assert!(old.cancelled());
+        assert!(!ProcessControl::default().cancelled());
+    }
+
+    #[test]
+    fn no_clobber_move_keeps_both_existing_files() {
+        let dir = std::env::temp_dir().join(format!("clamav-no-clobber-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source");
+        let destination = dir.join("destination");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&destination, b"destination").unwrap();
+        assert!(move_file_cross_drive(&source, &destination).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"source");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"destination");
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_file(destination).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     fn opts() -> ScanOptions {
         ScanOptions {

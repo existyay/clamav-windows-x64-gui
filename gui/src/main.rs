@@ -15,14 +15,14 @@ mod widgets;
 use eframe::egui;
 
 /// Outcome of the single-instance check.
+#[cfg(windows)]
 enum InstanceGuard {
     /// We own the guard; the handle must stay alive for the process lifetime.
-    Acquired(*mut std::ffi::c_void),
+    Acquired(*mut std::ffi::c_void, std::fs::File),
     /// Another instance already holds it.
     AlreadyRunning,
-    /// The guard could not be created (unusual permissions, an odd session
-    /// type). Startup continues rather than refusing to run — see below.
-    Unavailable,
+    /// No exclusive file lock could be obtained; startup must fail closed.
+    Unavailable(String),
 }
 
 /// Handle of the single-instance mutex.
@@ -36,70 +36,97 @@ enum InstanceGuard {
 static INSTANCE_HANDLE: std::sync::atomic::AtomicPtr<std::ffi::c_void> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
-/// Drop the single-instance lock so another copy can claim it.
+/// All new instances participate in the same file-lock protocol. The named
+/// mutex is retained only for compatibility with older versions.
 #[cfg(windows)]
-fn release_single_instance() {
-    use std::sync::atomic::Ordering;
+static INSTANCE_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
 
-    let handle = INSTANCE_HANDLE.swap(std::ptr::null_mut(), Ordering::SeqCst);
+#[cfg(windows)]
+const INSTANCE_MUTEX_NAME: &str = "ClamAV_GUI_SingleInstance_v1";
+
+/// Close the legacy mutex before the file, so a new file-lock owner never sees
+/// our stale mutex during handover. Serialize release/reacquire with the file slot.
+#[cfg(windows)]
+fn release_instance_locks(
+    file: &std::sync::Mutex<Option<std::fs::File>>,
+    mutex: &std::sync::atomic::AtomicPtr<std::ffi::c_void>,
+) {
+    let mut file = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let handle = mutex.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst);
     if !handle.is_null() {
-        // Closing the last handle destroys the mutex, so the next
-        // `CreateMutexW` succeeds instead of reporting an existing instance.
         unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
     }
+    file.take();
 }
 
-/// Take the lock back when a handover did not actually happen — for example the
-/// user dismissed the UAC prompt — so this instance still behaves like the only
-/// one.
 #[cfg(windows)]
-fn reacquire_single_instance() {
-    use std::sync::atomic::Ordering;
+fn release_single_instance() {
+    release_instance_locks(&INSTANCE_FILE, &INSTANCE_HANDLE);
+}
 
-    if !INSTANCE_HANDLE.load(Ordering::SeqCst).is_null() {
-        return;
+/// Restore both guards after a failed handover. Failure must never leave the
+/// existing GUI running without the common file lock.
+#[cfg(windows)]
+fn reacquire_instance_locks(
+    file: &std::sync::Mutex<Option<std::fs::File>>,
+    mutex: &std::sync::atomic::AtomicPtr<std::ffi::c_void>,
+    acquire: impl FnOnce() -> InstanceGuard,
+) -> Result<(), String> {
+    let mut file = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if file.is_some() {
+        return Ok(());
     }
-    if let InstanceGuard::Acquired(handle) = acquire_single_instance() {
-        INSTANCE_HANDLE.store(handle, Ordering::SeqCst);
+    match acquire() {
+        InstanceGuard::Acquired(handle, acquired_file) => {
+            mutex.store(handle, std::sync::atomic::Ordering::SeqCst);
+            *file = Some(acquired_file);
+            Ok(())
+        }
+        InstanceGuard::AlreadyRunning => Err("另一实例已取得单实例锁".to_string()),
+        InstanceGuard::Unavailable(reason) => Err(reason),
     }
 }
 
-/// Prevent duplicate instances using a Windows named mutex.
-///
-/// Two things matter here:
-///
-/// * The mutex is **session-local** (no `Global\` prefix). A `Global\` object can
-///   fail with `ERROR_ACCESS_DENIED` for a non-elevated process, and the old
-///   code treated *any* failure as "already running" — so the app could refuse
-///   to start at all and just print a wrong message box. A failure to create the
-///   guard now simply means "run without a guard".
-/// * `GetLastError` is only consulted when creation actually returned a handle.
+#[cfg(windows)]
+fn reacquire_single_instance() -> Result<(), String> {
+    reacquire_instance_locks(&INSTANCE_FILE, &INSTANCE_HANDLE, acquire_single_instance)
+}
+
 #[cfg(windows)]
 fn acquire_single_instance() -> InstanceGuard {
+    let Some(path) = config::AppConfig::fallback_config_path()
+        .map(|config| config.with_file_name("instance.lock"))
+    else {
+        return InstanceGuard::Unavailable("没有可用的用户目录，无法创建单实例锁".to_string());
+    };
+    acquire_single_instance_at(&path, INSTANCE_MUTEX_NAME)
+}
+
+/// Take the common lock first, even if the legacy mutex is available. Otherwise
+/// a mutex owner and a file-only owner could both run. A mutex creation failure
+/// is safe only because we already hold the exclusive file lock.
+#[cfg(windows)]
+fn acquire_single_instance_at(path: &std::path::Path, mutex_name: &str) -> InstanceGuard {
     use windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS;
     use windows_sys::Win32::System::Threading::CreateMutexW;
 
-    let name: Vec<u16> = "ClamAV_GUI_SingleInstance_v1\0".encode_utf16().collect();
+    let file = match acquire_file_lock(path) {
+        LockFileOutcome::Acquired(file) => file,
+        LockFileOutcome::Held => return InstanceGuard::AlreadyRunning,
+        LockFileOutcome::Unavailable(reason) => return InstanceGuard::Unavailable(reason),
+    };
+    let name: Vec<u16> = mutex_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
-
-    if handle.is_null() {
-        return InstanceGuard::Unavailable;
-    }
-
-    if unsafe { windows_sys::Win32::Foundation::GetLastError() } == ERROR_ALREADY_EXISTS {
-        // We still own a handle; release it before reporting.
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(handle);
-        }
+    if !handle.is_null()
+        && unsafe { windows_sys::Win32::Foundation::GetLastError() } == ERROR_ALREADY_EXISTS
+    {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
         return InstanceGuard::AlreadyRunning;
     }
-
-    InstanceGuard::Acquired(handle)
-}
-
-#[cfg(not(windows))]
-fn acquire_single_instance() -> InstanceGuard {
-    InstanceGuard::Unavailable
+    InstanceGuard::Acquired(handle, file)
 }
 
 /// Name of the event a second launch uses to ask the running copy to show itself.
@@ -114,13 +141,18 @@ static WAKE_EVENT: std::sync::atomic::AtomicPtr<std::ffi::c_void> =
 /// Create the (auto-reset, initially unsignalled) wake event.
 #[cfg(windows)]
 fn create_wake_event() -> *mut std::ffi::c_void {
+    create_wake_event_named(WAKE_EVENT_NAME)
+}
+
+#[cfg(windows)]
+fn create_wake_event_named(event_name: &str) -> *mut std::ffi::c_void {
     use windows_sys::Win32::System::Threading::CreateEventW;
 
     /// `CreateEventW`: not manual-reset, initially unsignalled.
     const AUTO_RESET: i32 = 0;
     const NOT_SIGNALLED: i32 = 0;
 
-    let name: Vec<u16> = WAKE_EVENT_NAME
+    let name: Vec<u16> = event_name
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -135,10 +167,15 @@ fn create_wake_event() -> *mut std::ffi::c_void {
 /// is treated as one.
 #[cfg(windows)]
 fn signal_running_instance() {
+    signal_wake_event_named(WAKE_EVENT_NAME);
+}
+
+#[cfg(windows)]
+fn signal_wake_event_named(event_name: &str) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
 
-    let name: Vec<u16> = WAKE_EVENT_NAME
+    let name: Vec<u16> = event_name
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -291,7 +328,7 @@ pub(crate) fn log_launch(decision: &str, detail: &str) {
         .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()));
 }
 
-/// Outcome of the lock-file fallback used when the named mutex cannot exist.
+/// Outcome of the common exclusive file lock used by every new instance.
 #[cfg(windows)]
 enum LockFileOutcome {
     /// We hold it. The file must stay open for the process lifetime, which is
@@ -299,32 +336,23 @@ enum LockFileOutcome {
     Acquired(std::fs::File),
     /// Another process already holds it.
     Held,
-    /// The lock could not be created for some other reason (a read-only account
-    /// directory, for instance), so there is no guard at all.
+    /// The lock could not be created; the caller must refuse to run.
     Unavailable(String),
 }
 
-/// Hold `%APPDATA%\ClamAV GUI\instance.lock` open exclusively.
-///
-/// `CreateMutexW` is the primary guard, but it can fail to return a handle at
-/// all in unusual security contexts. Startup used to continue in that case,
-/// which meant *every* launch became its own instance — precisely the "it opened
-/// twice again" symptom. `share_mode(0)` is the Windows way of saying "nobody
-/// else may open this file", so the second copy gets `ERROR_SHARING_VIOLATION`.
+/// `share_mode(0)` denies every other opener, including elevated copies.
+/// Never remove the lock file: its open handle, not its existence, is the lock.
 #[cfg(windows)]
-fn acquire_fallback_lock() -> LockFileOutcome {
+fn acquire_file_lock(path: &std::path::Path) -> LockFileOutcome {
     use std::os::windows::fs::OpenOptionsExt;
 
     /// `ERROR_SHARING_VIOLATION`, i.e. somebody holds the file.
     const SHARING_VIOLATION: i32 = 32;
 
-    let Some(path) = config::AppConfig::fallback_config_path()
-        .map(|config| config.with_file_name("instance.lock"))
-    else {
-        return LockFileOutcome::Unavailable("没有可用的用户目录".to_string());
-    };
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        if let Err(err) = std::fs::create_dir_all(dir) {
+            return LockFileOutcome::Unavailable(format!("无法创建单实例锁目录: {err}"));
+        }
     }
 
     let opened = std::fs::OpenOptions::new()
@@ -333,7 +361,7 @@ fn acquire_fallback_lock() -> LockFileOutcome {
         .create(true)
         .truncate(false)
         .share_mode(0)
-        .open(&path);
+        .open(path);
 
     match opened {
         Ok(file) => LockFileOutcome::Acquired(file),
@@ -342,9 +370,26 @@ fn acquire_fallback_lock() -> LockFileOutcome {
     }
 }
 
-/// Keeps the fallback lock file open for the whole process lifetime.
+/// Explain a fail-closed decision before exiting a windowless executable.
 #[cfg(windows)]
-static FALLBACK_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+fn report_instance_error(reason: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    log_launch("lock-failed", reason);
+    let text: Vec<u16> = format!("无法安全持有单实例锁，程序将退出。\n\n{reason}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let caption: Vec<u16> = "ClamAV 安全中心\0".encode_utf16().collect();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        )
+    };
+}
 
 /// Install a panic hook that leaves a trace and tells the user.
 ///
@@ -514,8 +559,12 @@ pub(crate) fn relaunch_as_admin() -> Result<(), String> {
     } as isize;
 
     if result <= SHELL_SUCCESS_THRESHOLD {
-        // Nothing was launched, so take the lock back and carry on as before.
-        reacquire_single_instance();
+        // Another launch may have won during the UAC prompt. Never keep this
+        // GUI alive without the common lock if restoring ownership fails.
+        if let Err(reason) = reacquire_single_instance() {
+            report_instance_error(&format!("管理员重启失败，且无法重新取得单实例锁: {reason}"));
+            std::process::exit(1);
+        }
 
         // 5 (SE_ERR_ACCESSDENIED) is what a cancelled UAC prompt reports.
         Err(format!(
@@ -542,7 +591,10 @@ fn main() -> eframe::Result<()> {
     // needs to reach it so it can release the lock during the handover.
     #[cfg(windows)]
     match acquire_single_instance() {
-        InstanceGuard::Acquired(handle) => {
+        InstanceGuard::Acquired(handle, file) => {
+            *INSTANCE_FILE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(file);
             INSTANCE_HANDLE.store(handle, std::sync::atomic::Ordering::SeqCst);
             // The event a later launch signals to ask for the window back.
             WAKE_EVENT.store(create_wake_event(), std::sync::atomic::Ordering::SeqCst);
@@ -559,25 +611,9 @@ fn main() -> eframe::Result<()> {
             log_launch("woken-existing", "");
             return Ok(());
         }
-        InstanceGuard::Unavailable => {
-            // No mutex: fall back to the lock file instead of starting unguarded.
-            // Silently starting unguarded is what lets one launch turn into many.
-            match acquire_fallback_lock() {
-                LockFileOutcome::Acquired(file) => {
-                    let _ = FALLBACK_LOCK.set(file);
-                    WAKE_EVENT.store(create_wake_event(), std::sync::atomic::Ordering::SeqCst);
-                    log_launch("owned-fallback", "named mutex unavailable");
-                }
-                LockFileOutcome::Held => {
-                    allow_running_instance_to_raise_itself();
-                    signal_running_instance();
-                    log_launch("woken-existing", "named mutex unavailable, lock file held");
-                    return Ok(());
-                }
-                LockFileOutcome::Unavailable(reason) => {
-                    log_launch("owned-unguarded", &format!("no guard available: {reason}"));
-                }
-            }
+        InstanceGuard::Unavailable(reason) => {
+            report_instance_error(&reason);
+            std::process::exit(1);
         }
     }
 
@@ -620,104 +656,152 @@ mod instance_tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
-    /// Store an acquired handle, reporting whether the lock was actually won.
-    fn take(guard: InstanceGuard) -> bool {
-        match guard {
-            InstanceGuard::Acquired(handle) => {
-                INSTANCE_HANDLE.store(handle, Ordering::SeqCst);
-                true
+    struct IsolatedInstance {
+        path: std::path::PathBuf,
+        name: String,
+        file: std::sync::Mutex<Option<std::fs::File>>,
+        mutex: std::sync::atomic::AtomicPtr<std::ffi::c_void>,
+    }
+
+    impl IsolatedInstance {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let name = format!(
+                "ClamAV_GUI_Test_{}_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            );
+            Self {
+                path: std::env::temp_dir().join(&name).join("instance.lock"),
+                name,
+                file: std::sync::Mutex::new(None),
+                mutex: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             }
-            _ => false,
+        }
+
+        fn acquire(&self) -> InstanceGuard {
+            acquire_single_instance_at(&self.path, &self.name)
+        }
+
+        fn restore(&self) -> Result<(), String> {
+            reacquire_instance_locks(&self.file, &self.mutex, || self.acquire())
+        }
+    }
+
+    impl Drop for IsolatedInstance {
+        fn drop(&mut self) {
+            release_instance_locks(&self.file, &self.mutex);
+            // The exact unique test directory, never the production lock path.
+            let directory = self.path.parent().unwrap();
+            assert!(directory.is_absolute());
+            assert_eq!(directory.file_name().unwrap().to_str().unwrap(), self.name);
+            let _ = std::fs::remove_dir_all(directory);
         }
     }
 
     #[test]
     fn the_guard_is_exclusive_and_survives_a_handover() {
-        // A real instance may be running on a developer's machine, in which case
-        // there is nothing this test can assert about the lock.
-        if !take(acquire_single_instance()) {
-            eprintln!("skipping: another instance already holds the lock");
-            return;
-        }
-
-        // While we hold it, a duplicate must be turned away.
-        assert!(
-            matches!(acquire_single_instance(), InstanceGuard::AlreadyRunning),
-            "a second instance should not be allowed to start"
-        );
-
-        // The handover: releasing must let the elevated copy claim the lock.
-        // Without this, "restart as administrator" left the user with no window,
-        // because the new process saw the old lock and quit while this one was
-        // quitting too.
-        release_single_instance();
-        assert!(
-            take(acquire_single_instance()),
-            "the elevated copy could not claim the lock after release"
-        );
-
-        // Reacquiring while the lock is already held must be a no-op, so a
-        // cancelled UAC prompt cannot leave a second handle behind.
-        reacquire_single_instance();
-        assert!(
-            matches!(acquire_single_instance(), InstanceGuard::AlreadyRunning),
-            "reacquire should not have dropped the lock"
-        );
-
-        release_single_instance();
+        let instance = IsolatedInstance::new();
+        instance.restore().expect("initial lock");
+        assert!(matches!(instance.acquire(), InstanceGuard::AlreadyRunning));
+        release_instance_locks(&instance.file, &instance.mutex);
+        instance.restore().expect("handover lock");
+        instance.restore().expect("idempotent restore");
+        assert!(matches!(instance.acquire(), InstanceGuard::AlreadyRunning));
+        release_instance_locks(&instance.file, &instance.mutex);
+        instance.restore().expect("cancelled UAC restores the lock");
     }
 
-    /// The lock-file fallback exists for the case where the named mutex cannot
-    /// be created at all. A fallback that admits two copies would defeat the
-    /// point, so it has to be exclusive in the same way.
     #[test]
-    fn the_fallback_lock_is_exclusive() {
-        let LockFileOutcome::Acquired(_held) = acquire_fallback_lock() else {
-            // Somebody else holds it right now, which is itself proof that the
-            // lock works. (A real instance uses the mutex, not this file.)
-            return;
+    fn common_file_lock_excludes_both_mutex_and_file_only_owners() {
+        let instance = IsolatedInstance::new();
+        let LockFileOutcome::Acquired(file) = acquire_file_lock(&instance.path) else {
+            panic!("isolated file lock unavailable");
         };
-
-        assert!(
-            matches!(acquire_fallback_lock(), LockFileOutcome::Held),
-            "a second holder of the fallback lock should have been turned away"
-        );
+        assert!(matches!(instance.acquire(), InstanceGuard::AlreadyRunning));
+        drop(file);
+        instance.restore().unwrap();
+        assert!(matches!(
+            acquire_file_lock(&instance.path),
+            LockFileOutcome::Held
+        ));
     }
 
-    /// The event that turns a second launch into "show the window" must be
-    /// reachable by name: the launching copy only ever opens it by name, never
-    /// by handle, so a typo or a `#[cfg]` mismatch would silently do nothing.
+    #[test]
+    fn mutex_failure_still_requires_the_common_file_lock() {
+        let instance = IsolatedInstance::new();
+        // An event with this unique name makes CreateMutexW fail with a type
+        // collision, without changing any production mutex or event.
+        let event = create_wake_event_named(&instance.name);
+        assert!(!event.is_null());
+        instance.restore().unwrap();
+        assert!(instance.mutex.load(Ordering::SeqCst).is_null());
+        assert!(matches!(instance.acquire(), InstanceGuard::AlreadyRunning));
+        release_instance_locks(&instance.file, &instance.mutex);
+        instance
+            .restore()
+            .expect("file-only handover must release the file");
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(event) };
+    }
+
+    #[test]
+    fn unavailable_lock_and_lost_uac_handover_fail_closed() {
+        let instance = IsolatedInstance::new();
+        std::fs::create_dir_all(instance.path.parent().unwrap()).unwrap();
+        std::fs::write(&instance.path, b"blocking parent").unwrap();
+        assert!(matches!(
+            acquire_single_instance_at(&instance.path.join("child"), &instance.name),
+            InstanceGuard::Unavailable(_)
+        ));
+        instance.restore().unwrap();
+        release_instance_locks(&instance.file, &instance.mutex);
+        let LockFileOutcome::Acquired(other_owner) = acquire_file_lock(&instance.path) else {
+            panic!("other owner must claim released file");
+        };
+        assert!(instance.restore().is_err());
+        assert!(instance.file.lock().unwrap().is_none());
+        assert!(instance.mutex.load(Ordering::SeqCst).is_null());
+        drop(other_owner);
+        assert!(
+            reacquire_instance_locks(&instance.file, &instance.mutex, || {
+                InstanceGuard::Unavailable("injected failure".to_string())
+            })
+            .is_err()
+        );
+        assert!(instance.file.lock().unwrap().is_none());
+    }
+
     #[test]
     fn a_second_launch_is_able_to_wake_the_running_copy() {
-        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
-        let handle = create_wake_event();
-        assert!(!handle.is_null(), "the wake event could not be created");
-
-        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-            // A real instance is running and owns this event; leave it alone.
-            unsafe { CloseHandle(handle) };
-            eprintln!("skipping: a running instance owns the wake event");
-            return;
-        }
-
-        WAKE_EVENT.store(handle, Ordering::SeqCst);
-
-        // Nothing has asked for the window yet.
-        assert!(!take_wake_request(), "spurious wake-up");
-
-        signal_running_instance();
+        let instance = IsolatedInstance::new();
+        let handle = create_wake_event_named(&instance.name);
         assert!(
-            take_wake_request(),
-            "the running copy was not woken by a second launch"
+            !handle.is_null(),
+            "the isolated wake event could not be created"
         );
-
-        // Auto-reset: one launch is one request.
-        assert!(!take_wake_request(), "the request was not consumed");
-
-        let handle = WAKE_EVENT.swap(std::ptr::null_mut(), Ordering::SeqCst);
-        if !handle.is_null() {
-            unsafe { CloseHandle(handle) };
-        }
+        assert_ne!(
+            unsafe { WaitForSingleObject(handle, 0) },
+            0,
+            "spurious wake-up"
+        );
+        signal_wake_event_named(&instance.name);
+        assert_eq!(
+            unsafe { WaitForSingleObject(handle, 0) },
+            0,
+            "wake request missing"
+        );
+        assert_ne!(
+            unsafe { WaitForSingleObject(handle, 0) },
+            0,
+            "request was not consumed"
+        );
+        unsafe { CloseHandle(handle) };
     }
 }

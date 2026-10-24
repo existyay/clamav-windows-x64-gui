@@ -67,6 +67,8 @@ pub struct RealtimeProtection {
     pub last_error: Option<String>,
     cancel_flag: Arc<Mutex<bool>>,
     receiver: Option<mpsc::Receiver<RealtimeMessage>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    stopping: bool,
 }
 
 impl Default for RealtimeProtection {
@@ -80,6 +82,8 @@ impl Default for RealtimeProtection {
             last_error: None,
             cancel_flag: Arc::new(Mutex::new(false)),
             receiver: None,
+            worker: None,
+            stopping: false,
         }
     }
 }
@@ -100,19 +104,13 @@ pub fn yamagoya_log_path(log_dir: &Path) -> PathBuf {
 /// A pid file records the process id *and* the image path it should belong to.
 struct DaemonRecord {
     pid: u32,
-    image: Option<PathBuf>,
 }
 
 fn read_daemon_record(log_dir: &Path) -> Option<DaemonRecord> {
     let text = std::fs::read_to_string(pid_file_path(log_dir)).ok()?;
     let mut lines = text.lines();
     let pid = lines.next()?.trim().parse::<u32>().ok()?;
-    let image = lines
-        .next()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from);
-    Some(DaemonRecord { pid, image })
+    Some(DaemonRecord { pid })
 }
 
 fn write_daemon_record(log_dir: &Path, pid: u32, image: &Path) {
@@ -202,7 +200,12 @@ fn same_executable(a: &Path, b: &Path) -> bool {
     !a.is_empty() && a == b
 }
 
-fn tail_log_loop(log_path: PathBuf, cancel: Arc<Mutex<bool>>, tx: mpsc::Sender<RealtimeMessage>) {
+fn tail_log_loop(
+    log_path: PathBuf,
+    cancel: Arc<Mutex<bool>>,
+    tx: mpsc::Sender<RealtimeMessage>,
+    pid: u32,
+) {
     // Wait for the daemon to create its log.
     for _ in 0..40 {
         if log_path.exists() {
@@ -230,7 +233,7 @@ fn tail_log_loop(log_path: PathBuf, cancel: Arc<Mutex<bool>>, tx: mpsc::Sender<R
     let mut line = String::with_capacity(512);
 
     loop {
-        if cancelled(&cancel) {
+        if cancelled(&cancel) || !is_process_alive(pid) {
             let _ = tx.send(RealtimeMessage::Stopped);
             return;
         }
@@ -294,7 +297,7 @@ impl RealtimeProtection {
 
     /// Re-attach to a daemon that outlived the previous GUI session.
     pub fn try_reconnect(&mut self, config: &AppConfig) {
-        if self.is_running() {
+        if self.is_running() || self.stopping || self.worker.is_some() {
             return;
         }
 
@@ -305,14 +308,9 @@ impl RealtimeProtection {
         let expected = config.yamagoya_path();
 
         // Verify identity, not just liveness: PIDs get reused.
-        let identity_ok = match process_image_path(record.pid) {
-            Some(actual) => same_executable(&actual, &expected),
-            None => record
-                .image
-                .as_ref()
-                .map(|recorded| same_executable(recorded, &expected))
-                .unwrap_or(false),
-        };
+        let identity_ok = process_image_path(record.pid)
+            .map(|actual| same_executable(&actual, &expected))
+            .unwrap_or(false);
 
         if !is_process_alive(record.pid) || !identity_ok {
             remove_daemon_record(&config.log_dir);
@@ -333,11 +331,27 @@ impl RealtimeProtection {
         )));
 
         let log_path = yamagoya_log_path(&config.log_dir);
-        std::thread::spawn(move || tail_log_loop(log_path, cancel, tx));
+        let pid = record.pid;
+        self.worker = Some(std::thread::spawn(move || {
+            tail_log_loop(log_path, cancel, tx, pid)
+        }));
     }
 
     /// Launch the monitor. Returns an error when YAMAGoya is unavailable.
     pub fn start(&mut self, config: &AppConfig) -> Result<(), String> {
+        self.finish_stop();
+        if self.stopping {
+            return Err("实时保护正在停止，请等待完成后再启动".to_string());
+        }
+        if self.is_running() {
+            return Ok(());
+        }
+        // A failed log reader is not proof that its daemon has exited.
+        // Reap the previous generation before replacing its channel or PID file.
+        if self.worker.is_some() {
+            self.stop_blocking(config);
+        }
+        self.try_reconnect(config);
         if self.is_running() {
             return Ok(());
         }
@@ -376,7 +390,7 @@ impl RealtimeProtection {
         let kill_process = config.yamagoya_kill_process;
         let log_dir = config.log_dir.clone();
 
-        std::thread::spawn(move || {
+        self.worker = Some(std::thread::spawn(move || {
             yamagoya_daemon_start(
                 yamagoya_for_start,
                 rules_dir,
@@ -387,27 +401,63 @@ impl RealtimeProtection {
                 cancel,
                 tx,
             );
-        });
+        }));
 
         Ok(())
     }
 
     /// Ask the monitor to stop; the teardown happens on a worker thread.
     pub fn stop(&mut self, config: &AppConfig) {
+        if self.stopping || (!self.is_running() && self.worker.is_none()) {
+            return;
+        }
         self.begin_stop();
-
+        self.stopping = true;
+        let previous = self.worker.take();
         let yamagoya = config.yamagoya_path();
         let log_dir = config.log_dir.clone();
-        std::thread::spawn(move || {
+        self.worker = Some(std::thread::spawn(move || {
+            // A start in flight must finish publishing its PID before teardown.
+            if let Some(worker) = previous {
+                let _ = worker.join();
+            }
             stop_yamagoya_daemon(&yamagoya, &log_dir);
-        });
+        }));
+    }
+
+    fn finish_stop(&mut self) {
+        if self.stopping
+            && self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| worker.is_finished())
+        {
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+            self.stopping = false;
+            self.state = RealtimeState::Stopped;
+            self.daemon_pid = None;
+            self.receiver = None;
+        }
     }
 
     /// Stop synchronously. Required from `Drop`, where a spawned thread would be
     /// torn down before it could finish.
     pub fn stop_blocking(&mut self, config: &AppConfig) {
-        self.begin_stop();
-        stop_yamagoya_daemon(&config.yamagoya_path(), &config.log_dir);
+        self.stop(config);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.stopping = false;
+        self.state = RealtimeState::Stopped;
+        self.daemon_pid = None;
+        self.receiver = None;
+    }
+
+    /// A stopped UI state alone does not prove its worker has finished.
+    pub fn has_pending_work(&self) -> bool {
+        self.is_running() || self.worker.is_some() || self.stopping
     }
 
     fn begin_stop(&mut self) {
@@ -419,6 +469,7 @@ impl RealtimeProtection {
     }
 
     pub fn poll_messages(&mut self) {
+        self.finish_stop();
         if let Some(rx) = self.receiver.take() {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
@@ -472,6 +523,12 @@ impl Drop for RealtimeProtection {
     fn drop(&mut self) {
         if let Ok(mut flag) = self.cancel_flag.lock() {
             *flag = true;
+        }
+        // Persist-on-exit must not interrupt an explicitly requested stop.
+        if self.stopping {
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
         }
     }
 }
@@ -580,6 +637,10 @@ fn yamagoya_daemon_start(
         cmd.creation_flags(0x0800_0000 | 0x0000_0008);
     }
 
+    if cancelled(&cancel) {
+        let _ = tx.send(RealtimeMessage::Stopped);
+        return;
+    }
     match cmd.spawn() {
         Ok(child) => {
             let pid = child.id();
@@ -592,7 +653,7 @@ fn yamagoya_daemon_start(
                 pid
             )));
 
-            tail_log_loop(log_path, cancel, tx);
+            tail_log_loop(log_path, cancel, tx, pid);
         }
         Err(e) => {
             let _ = tx.send(RealtimeMessage::Error(format!("启动 YAMAGoya 失败: {}", e)));
@@ -606,8 +667,6 @@ fn yamagoya_daemon_start(
 /// The daemon is only terminated once its image has been verified, so a
 /// recycled PID can never take down an unrelated program.
 fn stop_yamagoya_daemon(yamagoya_path: &Path, log_dir: &Path) {
-    release_etw_session(yamagoya_path);
-
     let Some(record) = read_daemon_record(log_dir) else {
         return;
     };
@@ -623,6 +682,7 @@ fn stop_yamagoya_daemon(yamagoya_path: &Path, log_dir: &Path) {
         .unwrap_or(false);
 
     if verified {
+        release_etw_session(yamagoya_path);
         kill_process(record.pid);
     }
 
@@ -741,5 +801,43 @@ fn split_rule_desc(text: &str) -> (String, String) {
             text[index + 3..].trim().to_string(),
         ),
         None => (text.trim().to_string(), String::new()),
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn restart_is_rejected_until_stop_worker_finishes() {
+        let (tx, rx) = mpsc::channel();
+        let mut protection = RealtimeProtection::default();
+        protection.stopping = true;
+        protection.worker = Some(std::thread::spawn(move || {
+            let _ = rx.recv();
+        }));
+        assert!(protection
+            .start(&AppConfig::default())
+            .unwrap_err()
+            .contains("正在停止"));
+        assert!(protection.has_pending_work());
+        tx.send(()).unwrap();
+        protection.worker.take().unwrap().join().unwrap();
+        protection.stopping = false;
+        assert!(!protection.has_pending_work());
+    }
+
+    #[test]
+    fn blocking_exit_joins_an_already_requested_stop() {
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = finished.clone();
+        let mut protection = RealtimeProtection::default();
+        protection.stopping = true;
+        protection.worker = Some(std::thread::spawn(move || {
+            signal.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        protection.stop_blocking(&AppConfig::default());
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!protection.has_pending_work());
     }
 }
