@@ -1180,6 +1180,13 @@ pub fn list_quarantine_entries(quarantine_dir: &Path) -> Vec<QuarantineEntry> {
 /// this program wrote but anyone with write access to the quarantine directory
 /// can edit — so it is never trusted blindly.
 pub fn restore_quarantined(entry: &QuarantineEntry) -> Result<(), String> {
+    restore_quarantined_with_privilege(entry, crate::is_elevated())
+}
+
+fn restore_quarantined_with_privilege(
+    entry: &QuarantineEntry,
+    elevated: bool,
+) -> Result<(), String> {
     let original = entry
         .meta
         .as_ref()
@@ -1195,7 +1202,7 @@ pub fn restore_quarantined(entry: &QuarantineEntry) -> Result<(), String> {
     }
     // Sidecars are writable data, not authority to write system locations with
     // elevated privileges. Restore from a non-elevated GUI instead.
-    if crate::is_elevated() {
+    if elevated {
         return Err("为避免被篡改的恢复路径以管理员权限写入，请使用普通权限运行后恢复".to_string());
     }
 
@@ -1457,7 +1464,11 @@ mod tests {
             }),
         };
 
-        let err = restore_quarantined(&entry).expect_err("must refuse an occupied path");
+        let elevated_error = restore_quarantined_with_privilege(&entry, true)
+            .expect_err("elevated restoration must fail closed");
+        assert!(elevated_error.contains("管理员权限"));
+        let err = restore_quarantined_with_privilege(&entry, false)
+            .expect_err("must refuse an occupied path");
         assert!(err.contains("同名文件"), "unexpected message: {err}");
         assert_eq!(
             std::fs::read(&original).expect("destination still readable"),
@@ -1468,7 +1479,7 @@ mod tests {
 
         // With the path free again the restore goes through as before.
         std::fs::remove_file(&original).expect("free the path");
-        restore_quarantined(&entry).expect("restore into the free path");
+        restore_quarantined_with_privilege(&entry, false).expect("restore into the free path");
         assert_eq!(
             std::fs::read(&original).expect("restored file"),
             b"quarantined payload"
